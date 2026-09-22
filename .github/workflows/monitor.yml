@@ -17,18 +17,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: bot.py
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-v1
+          key: playwright-${{ runner.os }}-${{ hashFiles('bot.py') }}
 
       - name: Install Chromium
-        run: uv run --with playwright playwright install --with-deps chromium
+        run: |
+          version=$(grep -oP '"playwright==\K[0-9.]+' bot.py)
+          uv run --with "playwright==$version" playwright install --with-deps chromium
 
       - name: Run bot
         env:
@@ -43,4 +48,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "chore: update seen projects" && git push)
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update seen projects"
+          # a push made during this run would otherwise reject ours and lose sent projects
+          git pull --rebase
+          git push
