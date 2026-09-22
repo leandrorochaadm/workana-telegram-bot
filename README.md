@@ -32,7 +32,7 @@ e você receberia avisos repetidos.
 
 2. Instale o Chromium do Playwright (uma vez só):
    ```
-   uv run --with playwright playwright install chromium
+   uv run --with playwright==1.63.0 playwright install chromium
    ```
 
 ## Rodar manualmente
@@ -44,7 +44,7 @@ e você receberia avisos repetidos.
 ## Testes
 
 ```
-uv run --with pytest --with playwright --with requests pytest -q
+uv run --with pytest --with playwright==1.63.0 --with requests pytest -q
 ```
 
 ## Agendamento local (launchd, macOS, alternativa ao GitHub Actions)
