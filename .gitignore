@@ -1,0 +1,5 @@
+.env
+bot.log
+bot.err.log
+__pycache__/
+.pytest_cache/

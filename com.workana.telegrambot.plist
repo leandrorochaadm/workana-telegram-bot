@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workana.telegrambot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/uv</string>
+        <string>run</string>
+        <string>--script</string>
+        <string>/Volumes/Dock/projects/workana-telegram-bot/bot.py</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/leandrorocha/Library/Logs/workana-telegram-bot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/leandrorocha/Library/Logs/workana-telegram-bot.err.log</string>
+</dict>
+</plist>
