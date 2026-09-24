@@ -1,8 +1,12 @@
 name: Monitor Workana
 
 on:
+  # Main schedule lives in scheduler/wrangler.jsonc: a Cloudflare Worker calls
+  # workflow_dispatch every 15 min, since GitHub's own schedule is delayed/dropped.
+  # This hourly cron is only a fallback in case the Worker stops (e.g. expired
+  # token); extra runs are harmless because seen.json deduplicates projects.
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "41 * * * *"
   workflow_dispatch:
 
 permissions:

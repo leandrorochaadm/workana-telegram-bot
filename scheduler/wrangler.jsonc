@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "workana-bot-scheduler",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // Cloudflare crons are always UTC: this just ticks every 15 min and
+  // src/index.js decides, in Brasília time, which bots to dispatch
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+
+  // GITHUB_TOKEN is a secret: `npx wrangler secret put GITHUB_TOKEN`
+  // It needs Actions: Read and write on every repo listed in JOBS
+
+  "workers_dev": false,
+  "observability": { "enabled": true }
+}
