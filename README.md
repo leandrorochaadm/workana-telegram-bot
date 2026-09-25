@@ -116,6 +116,24 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN
 Quando o token vencer, o log do Actions mostra `Falha na proposta de …: claude saiu com
 código 1 (… api_error_status=401)`. É só repetir os dois comandos acima.
 
+Para testar um token antes de salvar no secret:
+
+```
+./check_token.py <token>
+```
+
+- **Token válido:** mostra `Token válido.` e sai com código 0.
+- **Token recusado (401):** mostra `Token recusado (401): expirou ou foi revogado. Gere outro
+  com claude setup-token.` e sai com código 1.
+- **Outro erro:** mostra o código de saída e o detalhe do erro, e sai com código 1.
+
+O script roda o `claude` isolado do mesmo jeito que o bot (sem `ANTHROPIC_API_KEY`, sem
+ferramentas, sem configurações locais), então o resultado é o mesmo que o bot terá. A chamada
+usa o modelo `haiku` com um prompt mínimo, que gasta muito pouco da cota do plano.
+
+O token passado como parâmetro fica salvo no histórico do shell. Para evitar isso no zsh, ligue
+`setopt HIST_IGNORE_SPACE` e comece a linha com um espaço.
+
 O workflow instala uma versão fixa do Claude Code (`@anthropic-ai/claude-code@2.1.282` no
 `monitor.yml`), porque o bot depende das flags e do JSON de saída dessa versão. Para atualizar,
 troque a versão ali e dispare o workflow manualmente para conferir se a proposta chega.
