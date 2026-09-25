@@ -23,7 +23,7 @@ from pathlib import Path
 import anthropic
 import requests
 from cryptography.fernet import Fernet, InvalidToken
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Browser, Page, sync_playwright
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).parent
@@ -34,7 +34,15 @@ PENDING_FILE = BASE_DIR / "pending.json"
 # Encrypted because the repo is public and the prompt holds private pricing rules
 PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
 
-WORKANA_URL = "https://www.workana.com/jobs?language=pt&category=it-programming"
+# Jobs from the last 24h; a job listed by both searches is kept once
+WORKANA_URLS = (
+    "https://www.workana.com/jobs?language=pt&publication=1d&query=aplicativo&region=029%2C013%2C005",
+    "https://www.workana.com/jobs?language=pt&publication=1d&query=app&region=029%2C013%2C005",
+)
+JOB_LINK_SELECTOR = "a[href^='/job/']"
+NO_RESULTS_TEXT = "Não foram encontrados projetos"
+# Logged-out listings show 7 jobs per page, sorted by relevance, not by date
+MAX_PAGES_PER_SEARCH = 5
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -96,29 +104,68 @@ def save_pending(pending: dict[str, dict]) -> None:
 
 
 @contextmanager
-def open_page() -> Iterator[Page]:
+def open_browser() -> Iterator[Browser]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
-            yield browser.new_page(user_agent=USER_AGENT)
+            yield browser
         finally:
             browser.close()
 
 
+@contextmanager
+def fresh_page(browser: Browser) -> Iterator[Page]:
+    """A page in its own context, so no cookies carry over between loads."""
+    context = browser.new_context(user_agent=USER_AGENT)
+    try:
+        yield context.new_page()
+    finally:
+        context.close()
+
+
+@contextmanager
+def open_page() -> Iterator[Page]:
+    with open_browser() as browser, fresh_page(browser) as page:
+        yield page
+
+
 def fetch_projects() -> list[dict[str, str]]:
-    projects: list[dict[str, str]] = []
-    with open_page() as page:
-        page.goto(WORKANA_URL, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_selector("a[href^='/job/']", timeout=60_000)
-        for link in page.query_selector_all("a[href^='/job/']"):
+    projects: dict[str, dict[str, str]] = {}
+    with open_browser() as browser:
+        for search_url in WORKANA_URLS:
+            for page_number in range(1, MAX_PAGES_PER_SEARCH + 1):
+                page_url = f"{search_url}&page={page_number}"
+                if not _fetch_listing_page(browser, page_url, page_number, projects):
+                    break
+            else:
+                print(
+                    f"Limite de {MAX_PAGES_PER_SEARCH} páginas atingido em {search_url}",
+                    file=sys.stderr,
+                )
+    return list(projects.values())
+
+
+def _fetch_listing_page(
+    browser: Browser, url: str, page_number: int, projects: dict[str, dict[str, str]]
+) -> bool:
+    """Adds the page's jobs to `projects` (first listing wins) and says if a next page exists."""
+    # A fresh context per page: Cloudflare challenges the second load in the same session,
+    # and relaunching the whole browser instead costs ~1s more per page
+    with fresh_page(browser) as page:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # A 24h search can legitimately come back empty; a Cloudflare block still times out
+        page.locator(JOB_LINK_SELECTOR).or_(page.get_by_text(NO_RESULTS_TEXT)).first.wait_for(
+            timeout=60_000
+        )
+        for link in page.query_selector_all(JOB_LINK_SELECTOR):
             href = link.get_attribute("href") or ""
             span = link.query_selector("span[title]")
             title = ((span.get_attribute("title") if span else None) or link.inner_text()).strip()
             if not href or not title:
                 continue
-            url = f"https://www.workana.com{href.split('?')[0]}"
-            projects.append({"id": url, "title": title, "url": url})
-    return projects
+            job_url = f"https://www.workana.com{href.split('?')[0]}"
+            projects.setdefault(job_url, {"id": job_url, "title": title, "url": job_url})
+        return page.query_selector(f"ul.pagination a[href$='page={page_number + 1}']") is not None
 
 
 def fetch_description(url: str) -> str:

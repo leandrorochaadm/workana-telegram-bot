@@ -1,6 +1,7 @@
 # Workana Telegram Bot
 
-Monitora projetos novos na Workana (categoria TI e Programação, ordenados por mais recentes),
+Monitora projetos novos na Workana (buscas por "aplicativo" e "app" das últimas 24h, em
+português, clientes da América do Sul, Central e Caribe — ver `WORKANA_URLS` no `bot.py`),
 filtra por palavras-chave no título e avisa no Telegram. Opcionalmente, lê a descrição de cada
 vaga e gera uma proposta com o Claude (ver [Propostas com o Claude](#propostas-com-o-claude)).
 
@@ -117,5 +118,7 @@ porque o launchd não consegue gravar logs em `/Volumes/...`).
 
 - Usa Playwright (Chromium headless) porque a Workana está atrás de Cloudflare
   e bloqueia requisições HTTP simples (curl/requests puro).
+- Percorre até 5 páginas de cada busca (7 vagas por página), abrindo cada página numa sessão
+  limpa do navegador, porque a Cloudflare bloqueia o segundo carregamento na mesma sessão.
 - Mantém `seen.json` com os IDs de projetos já processados, para não notificar duas vezes.
 - Roda a cada 15 minutos via GitHub Actions, disparado pelo Cloudflare Worker (ou launchd, se rodar localmente).

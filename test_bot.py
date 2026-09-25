@@ -354,6 +354,89 @@ def test_generate_proposal_raises_without_parsed_output() -> None:
         bot.generate_proposal(client, "prompt", _project("x", "App"), "descrição")
 
 
+def test_fetch_projects_follows_pages_merges_searches_and_skips_empty_ones(
+    monkeypatch, capsys
+) -> None:
+    # {page url: (job links, has next page)}
+    pages = {
+        "https://w/a&page=1": ([("/job/x?ref=1", "App X")], True),
+        "https://w/a&page=2": ([("/job/y", "App Y")], False),
+        "https://w/b&page=1": ([("/job/y?ref=2", "App Y de novo"), ("", "Sem link")], False),
+        "https://w/empty&page=1": ([], False),
+        "https://w/capped&page=1": ([("/job/z", "App Z")], True),
+        "https://w/capped&page=2": ([], True),
+    }
+    visited: list[str] = []
+
+    class FakeElement:
+        def __init__(self, href, title):
+            self.href, self.title = href, title
+
+        def get_attribute(self, name):
+            return {"href": self.href, "title": self.title}[name]
+
+        def query_selector(self, _selector):
+            return self
+
+    class FakeLocator:
+        first = property(lambda self: self)
+
+        def or_(self, _other):
+            return self
+
+        def wait_for(self, **_kwargs):
+            pass
+
+    class FakePage:
+        def goto(self, url, **_kwargs):
+            visited[-1] = url
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+        def get_by_text(self, text):
+            assert text == bot.NO_RESULTS_TEXT
+            return FakeLocator()
+
+        def query_selector_all(self, _selector):
+            return [FakeElement(*link) for link in pages[visited[-1]][0]]
+
+        def query_selector(self, selector):
+            assert selector.startswith("ul.pagination")
+            return object() if pages[visited[-1]][1] else None
+
+    browsers: list[object] = []
+
+    @contextmanager
+    def fake_open_browser():
+        browsers.append(object())
+        yield browsers[-1]
+
+    @contextmanager
+    def fake_fresh_page(browser):
+        assert browser is browsers[-1]
+        visited.append("")
+        yield FakePage()
+
+    monkeypatch.setattr(bot, "open_browser", fake_open_browser)
+    monkeypatch.setattr(bot, "fresh_page", fake_fresh_page)
+    monkeypatch.setattr(bot, "MAX_PAGES_PER_SEARCH", 2)
+    monkeypatch.setattr(
+        bot, "WORKANA_URLS", ("https://w/a", "https://w/b", "https://w/empty", "https://w/capped")
+    )
+
+    def job(pid, title):
+        url = f"https://www.workana.com/job/{pid}"
+        return {"id": url, "title": title, "url": url}
+
+    assert bot.fetch_projects() == [job("x", "App X"), job("y", "App Y"), job("z", "App Z")]
+    # One browser for the whole scrape, a fresh page per listing, and the cap stops
+    # a search that still has a next page
+    assert len(browsers) == 1
+    assert visited == list(pages)
+    assert capsys.readouterr().err == "Limite de 2 páginas atingido em https://w/capped\n"
+
+
 def test_fetch_description_reads_detail_block(monkeypatch) -> None:
     visited: list[str] = []
 
