@@ -13,7 +13,7 @@ Como reserva, o próprio workflow roda de hora em hora (minuto 41), caso o Worke
 Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
-- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN` e `PROMPT_KEY`)
+- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`)
 - Variable: `KEYWORDS` (ex: `aplicativo,app`)
 
 Para trocar as palavras-chave:
@@ -55,8 +55,35 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
   propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
   tentada de novo na próxima execução, mesmo que já tenha saído da lista da Workana.
 - Depois de `MAX_PROPOSAL_ATTEMPTS` (3) falhas, a vaga chega sem proposta, com um aviso.
-- Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY` ou sem o comando `claude` no `PATH`, o bot
-  envia só o aviso da vaga, sem proposta.
+- Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`
+  ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
+
+O Claude não faz a conta do preço. Ele estima as horas de desenvolvimento e o número de telas, e
+escreve a proposta com os marcadores `{{PRECO}}`, `{{PRAZO}}`, `{{COBRANCA}}` e `{{REGUA}}`. O
+bot calcula preço, prazo, parcelas e piso com o `preco.py` (copiado da skill `proposta-freela`)
+e troca os marcadores pelos valores. Proposta com marcador faltando ou sobrando é tratada como
+falha e tentada de novo.
+
+Com o texto pronto, o bot roda as checagens de texto do `varredura.py` (também copiado da skill):
+travessão, emoji, conectores, palavras proibidas, número de tela ou hora, tamanho etc. O que ele
+achar como erro (ou marcador faltando) volta para o Claude na mesma execução, junto com a
+proposta anterior e o trecho de cada problema, para ele reescrever. São no máximo
+`MAX_REVISIONS` (2) revisões por proposta, e só antes do prazo da execução, então cada proposta
+pode gastar até 3 gerações da cota. O que sobrar depois disso, e os alertas, aparecem em
+"Varredura" na mensagem do Telegram, para corrigir antes de colar. Se uma revisão falhar ou
+quebrar os marcadores, vale a versão anterior. O `varredura.py` foi escrito para cliente direto,
+então o bot soma checagens da Workana, que suspende a conta: link, e-mail, telefone, site e
+convite para conversa contam como erro.
+
+O valor da hora e o valor mínimo de projeto são privados: no `preco.py` eles valem zero, e o bot
+os lê de `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT` (secrets no GitHub, `.env` no local). Os
+testes usam valores fictícios. Ao atualizar o `preco.py` a partir da skill, zere os dois de novo
+antes de commitar.
+
+```bash
+gh secret set PRICE_HOURLY_RATE
+gh secret set PRICE_MIN_PROJECT
+```
 
 A proposta é gerada pelo Claude Code em modo não interativo (`claude -p`), cobrado na
 assinatura Max, não na API. Cada proposta consome a mesma cota de uso do plano. Para gerar o
@@ -109,7 +136,8 @@ Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
    - `TELEGRAM_TOKEN`: token do bot (criado via @BotFather)
    - `TELEGRAM_CHAT_ID`: chat_id de destino
    - `KEYWORDS`: palavras separadas por vírgula (ex: `aplicativo,app`)
-   - `CLAUDE_CODE_OAUTH_TOKEN` e `PROMPT_KEY`: opcionais, para gerar propostas (exige o
+   - `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`:
+     opcionais, para gerar propostas (exige o
      Claude Code instalado: `npm install -g @anthropic-ai/claude-code@2.1.282`)
 
 2. Instale o Chromium do Playwright (uma vez só):
