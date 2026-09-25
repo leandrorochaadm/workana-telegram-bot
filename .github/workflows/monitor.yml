@@ -40,12 +40,16 @@ jobs:
           version=$(grep -oP '"playwright==\K[0-9.]+' bot.py)
           uv run --with "playwright==$version" playwright install --with-deps chromium
 
+      - name: Install Claude Code
+        # Pinned: the bot relies on this version's flags and JSON output
+        run: npm install -g @anthropic-ai/claude-code@2.1.282
+
       - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KEYWORDS: ${{ vars.KEYWORDS }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           PROMPT_KEY: ${{ secrets.PROMPT_KEY }}
         run: uv run --script bot.py
 

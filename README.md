@@ -13,7 +13,7 @@ Como reserva, o próprio workflow roda de hora em hora (minuto 41), caso o Worke
 Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
-- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `ANTHROPIC_API_KEY` e `PROMPT_KEY`)
+- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN` e `PROMPT_KEY`)
 - Variable: `KEYWORDS` (ex: `aplicativo,app`)
 
 Para trocar as palavras-chave:
@@ -55,7 +55,27 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
   propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
   tentada de novo na próxima execução, mesmo que já tenha saído da lista da Workana.
 - Depois de `MAX_PROPOSAL_ATTEMPTS` (3) falhas, a vaga chega sem proposta, com um aviso.
-- Sem `ANTHROPIC_API_KEY` ou `PROMPT_KEY`, o bot funciona como antes, só com o aviso.
+- Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY` ou sem o comando `claude` no `PATH`, o bot
+  envia só o aviso da vaga, sem proposta.
+
+A proposta é gerada pelo Claude Code em modo não interativo (`claude -p`), cobrado na
+assinatura Max, não na API. Cada proposta consome a mesma cota de uso do plano. Para gerar o
+token (vale cerca de 1 ano):
+
+```
+claude setup-token
+gh secret set CLAUDE_CODE_OAUTH_TOKEN
+```
+
+Quando o token vencer, o log do Actions mostra `Falha na proposta de …: claude saiu com
+código 1 (… api_error_status=401)`. É só repetir os dois comandos acima.
+
+O workflow instala uma versão fixa do Claude Code (`@anthropic-ai/claude-code@2.1.282` no
+`monitor.yml`), porque o bot depende das flags e do JSON de saída dessa versão. Para atualizar,
+troque a versão ali e dispare o workflow manualmente para conferir se a proposta chega.
+
+O secret `ANTHROPIC_API_KEY` não é mais usado e pode ser apagado:
+`gh secret delete ANTHROPIC_API_KEY`.
 
 O prompt tem regras de preço privadas e o repositório é público, por isso só a versão
 criptografada (`proposal_prompt.enc`) é commitada. O texto puro fica em `proposal_prompt.md`,
@@ -69,6 +89,18 @@ git add proposal_prompt.enc && git commit -m "chore: update proposal prompt"
 
 Sem `PROMPT_KEY`, o script gera uma chave nova; cadastre-a com `gh secret set PROMPT_KEY`.
 
+A `PROMPT_KEY` fica no `.env` local e no secret do GitHub, e as duas precisam ser iguais. O
+GitHub não deixa ler o valor de um secret; para garantir que ele bate com o `.env`, cadastre de
+novo a partir dele:
+
+```
+grep '^PROMPT_KEY=' .env | cut -d= -f2- | gh secret set PROMPT_KEY
+```
+
+Se perder a chave, rode `./encrypt_prompt.py` sem `PROMPT_KEY` definida: ele gera uma chave nova
+e criptografa o `proposal_prompt.md` de novo. Depois, guarde a chave no `.env`, cadastre-a com
+`gh secret set PROMPT_KEY` e commite o `proposal_prompt.enc` atualizado.
+
 Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
 
 ## Setup local
@@ -77,7 +109,8 @@ Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
    - `TELEGRAM_TOKEN`: token do bot (criado via @BotFather)
    - `TELEGRAM_CHAT_ID`: chat_id de destino
    - `KEYWORDS`: palavras separadas por vírgula (ex: `aplicativo,app`)
-   - `ANTHROPIC_API_KEY` e `PROMPT_KEY`: opcionais, para gerar propostas
+   - `CLAUDE_CODE_OAUTH_TOKEN` e `PROMPT_KEY`: opcionais, para gerar propostas (exige o
+     Claude Code instalado: `npm install -g @anthropic-ai/claude-code@2.1.282`)
 
 2. Instale o Chromium do Playwright (uma vez só):
    ```
@@ -93,7 +126,7 @@ Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
 ## Testes
 
 ```
-uv run --with pytest --with playwright==1.63.0 --with requests --with anthropic --with cryptography pytest -q
+uv run --with pytest --with playwright==1.63.0 --with requests --with pydantic --with cryptography pytest -q
 ```
 
 ## Agendamento local (launchd, macOS, alternativa ao GitHub Actions)
@@ -114,11 +147,15 @@ launchctl unload ~/Library/LaunchAgents/com.workana.telegrambot.plist
 Logs em `~/Library/Logs/workana-telegram-bot.log` e `.err.log` (fora do HD externo,
 porque o launchd não consegue gravar logs em `/Volumes/...`).
 
+O launchd roda com um `PATH` mínimo, sem `~/.local/bin` nem o `npm` global, então não acha o
+comando `claude` e segue sem propostas ("Claude Code não instalado" no `.err.log`).
+
 ## Como funciona
 
 - Usa Playwright (Chromium headless) porque a Workana está atrás de Cloudflare
   e bloqueia requisições HTTP simples (curl/requests puro).
 - Percorre até 5 páginas de cada busca (7 vagas por página), abrindo cada página numa sessão
   limpa do navegador, porque a Cloudflare bloqueia o segundo carregamento na mesma sessão.
-- Mantém `seen.json` com os IDs de projetos já processados, para não notificar duas vezes.
+- Mantém `seen.json` com os IDs de projetos já processados, para não notificar duas vezes, e
+  `pending.json` com as vagas que ainda esperam proposta.
 - Roda a cada 15 minutos via GitHub Actions, disparado pelo Cloudflare Worker (ou launchd, se rodar localmente).

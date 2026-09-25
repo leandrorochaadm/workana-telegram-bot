@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -39,7 +40,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "SEEN_FILE", tmp_path / "seen.json")
     monkeypatch.setattr(bot, "PENDING_FILE", tmp_path / "pending.json")
     monkeypatch.setattr(bot, "PROMPT_FILE", tmp_path / "proposal_prompt.enc")
-    for var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "ANTHROPIC_API_KEY", "PROMPT_KEY"):
+    for var in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY"):
         monkeypatch.delenv(var, raising=False)
     (tmp_path / ".env").write_text(
         "# comment\nTELEGRAM_TOKEN=tok\n\nTELEGRAM_CHAT_ID=42\nKEYWORDS= aplicativo , app ,\n"
@@ -168,19 +169,22 @@ def with_proposals(workdir, monkeypatch):
     key = Fernet.generate_key().decode()
     bot.PROMPT_FILE.write_bytes(Fernet(key.encode()).encrypt("prompt secreto".encode()))
     with bot.ENV_FILE.open("a") as f:
-        f.write(f"ANTHROPIC_API_KEY=sk-test\nPROMPT_KEY={key}\n")
+        f.write(f"CLAUDE_CODE_OAUTH_TOKEN=oauth-test\nPROMPT_KEY={key}\n")
     calls: list[tuple[str, str]] = []
 
     def fake_generate(_client, system, project, description):
         calls.append((system, description))
         if "quebra" in project["title"]:
             raise RuntimeError("boom")
+        if "vencido" in project["title"]:
+            raise bot.ProposalError("claude saiu com código 1 (api_error_status=401)")
         if "inesperado" in project["title"]:
             raise ValueError("saída do modelo com texto sigiloso")
         return PROPOSAL
 
     monkeypatch.setattr(bot, "fetch_description", lambda url: f"descrição de {url}")
     monkeypatch.setattr(bot, "generate_proposal", fake_generate)
+    monkeypatch.setattr(bot.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
     return calls
 
 
@@ -257,6 +261,25 @@ def test_main_skips_proposals_with_wrong_key(with_proposals, sent, monkeypatch) 
     assert len(sent) == 1
 
 
+def test_main_skips_proposals_without_claude_cli(with_proposals, sent, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(bot.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+
+    bot.main()
+
+    assert with_proposals == []
+    assert len(sent) == 1
+    assert "Claude Code não instalado" in capsys.readouterr().err
+
+
+def test_main_logs_proposal_error_details(with_proposals, sent, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App vencido")])
+
+    bot.main()
+
+    assert "api_error_status=401" in capsys.readouterr().err
+
+
 def test_split_message_respects_limit() -> None:
     text = "\n".join(["linha " * 10] * 20)
     chunks = bot.split_message(text, limit=100)
@@ -318,40 +341,61 @@ def test_format_notification_omits_empty_notes() -> None:
     assert "📝" not in text
 
 
-class FakeMessages:
-    def __init__(self, parsed_output) -> None:
-        self.parsed_output = parsed_output
-        self.kwargs: dict = {}
+def _fake_claude(monkeypatch, returncode: int = 0, output: dict | None = None) -> list[dict]:
+    calls: list[dict] = []
 
-    def parse(self, **kwargs):
-        self.kwargs = kwargs
-        return SimpleNamespace(parsed_output=self.parsed_output, stop_reason="end_turn")
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, **kwargs})
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(output or {}))
+
+    monkeypatch.setattr(bot.subprocess, "run", fake_run)
+    return calls
 
 
-def test_generate_proposal_sends_prompt_and_job() -> None:
-    messages = FakeMessages(PROPOSAL)
-    client = SimpleNamespace(messages=messages)
+def test_generate_proposal_sends_prompt_and_job(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
+    calls = _fake_claude(monkeypatch, output={"structured_output": PROPOSAL.model_dump()})
 
-    result = bot.generate_proposal(client, "prompt", _project("x", "App novo"), "descrição")
+    result = bot.generate_proposal("oauth-tok", "prompt", _project("x", "App novo"), "descrição")
 
-    assert result is PROPOSAL
-    kwargs = messages.kwargs
-    assert kwargs["model"] == bot.PROPOSAL_MODEL
-    assert kwargs["output_format"] is bot.Proposal
-    assert kwargs["system"] == [
-        {"type": "text", "text": "prompt", "cache_control": {"type": "ephemeral"}}
-    ]
-    content = kwargs["messages"][0]["content"]
+    assert result == PROPOSAL
+    cmd = calls[0]["cmd"]
+    assert cmd[:2] == ["claude", "-p"]
+    assert cmd[cmd.index("--model") + 1] == bot.PROPOSAL_MODEL
+    assert cmd[cmd.index("--system-prompt") + 1] == "prompt"
+    assert json.loads(cmd[cmd.index("--json-schema") + 1]) == bot.Proposal.model_json_schema()
+    content = calls[0]["input"]
     assert content.startswith("<vaga>") and content.endswith("</vaga>")
     assert "App novo" in content and "https://www.workana.com/job/x" in content
     assert "descrição" in content
+    env = calls[0]["env"]
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
-def test_generate_proposal_raises_without_parsed_output() -> None:
-    client = SimpleNamespace(messages=FakeMessages(None))
+def test_generate_proposal_raises_on_cli_failure(monkeypatch) -> None:
+    _fake_claude(
+        monkeypatch, returncode=1, output={"is_error": True, "api_error_status": 401}
+    )
 
-    with pytest.raises(RuntimeError, match="stop_reason=end_turn"):
-        bot.generate_proposal(client, "prompt", _project("x", "App"), "descrição")
+    with pytest.raises(bot.ProposalError, match="código 1.*api_error_status=401"):
+        bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
+
+def test_generate_proposal_raises_on_non_json_output(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="boom")
+    )
+
+    with pytest.raises(bot.ProposalError, match="código 1"):
+        bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
+
+def test_generate_proposal_raises_without_structured_output(monkeypatch) -> None:
+    _fake_claude(monkeypatch, output={"is_error": True, "subtype": "error_max_turns"})
+
+    with pytest.raises(bot.ProposalError, match="subtype=error_max_turns"):
+        bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
 
 def test_fetch_projects_follows_pages_merges_searches_and_skips_empty_ones(

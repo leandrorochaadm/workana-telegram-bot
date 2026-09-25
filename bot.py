@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "anthropic",
 #   "cryptography",
 #   "playwright==1.63.0",
+#   "pydantic",
 #   "requests",
 # ]
 # ///
@@ -14,13 +14,15 @@ import html
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-import anthropic
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, Page, sync_playwright
@@ -49,18 +51,21 @@ USER_AGENT = (
 )
 
 PROPOSAL_MODEL = "claude-opus-5-5"
-# Keeps a burst of new jobs from blowing the workflow timeout and the API bill
+# Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, the
-# deadline below, then one last proposal (job page + one API call) and the commit
+# deadline below, then one last proposal (job page + one Claude call) and the commit
 PROPOSAL_TIMEOUT_SECONDS = 180
-PROPOSAL_MAX_RETRIES = 0
 PAGE_TIMEOUT_MS = 30_000
 PROPOSAL_DEADLINE_SECONDS = 8 * 60
 # A job that keeps failing (refusal, page gone) is sent without a proposal after
 # this many tries, so it cannot bill every run forever
 MAX_PROPOSAL_ATTEMPTS = 3
 TELEGRAM_MAX_CHARS = 4096
+
+
+class ProposalError(Exception):
+    """A failure whose message is safe for public logs: it never holds model output."""
 
 
 class Proposal(BaseModel):
@@ -181,27 +186,49 @@ def load_prompt(key: str) -> str:
 
 
 def generate_proposal(
-    client: anthropic.Anthropic, system: str, project: dict[str, str], description: str
+    oauth_token: str, system: str, project: dict[str, str], description: str
 ) -> Proposal:
-    response = client.messages.parse(
-        model=PROPOSAL_MODEL,
-        max_tokens=16000,
-        output_config={"effort": "high"},
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n"
-                    f"{description}\n</vaga>"
-                ),
-            }
+    """Runs Claude Code in print mode, billed to the Max plan behind `oauth_token`."""
+    # Without the API key, the CLI cannot fall back to pay-per-use billing
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    result = subprocess.run(
+        [
+            "claude",
+            "-p",
+            "--model", PROPOSAL_MODEL,
+            "--effort", "high",
+            "--system-prompt", system,
+            # A plain answer: no tools, no settings, no saved session
+            "--tools", "",
+            "--setting-sources", "",
+            "--no-session-persistence",
+            "--output-format", "json",
+            "--json-schema", json.dumps(Proposal.model_json_schema()),
         ],
-        output_format=Proposal,
+        input=(
+            f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n"
+            f"{description}\n</vaga>"
+        ),
+        capture_output=True,
+        text=True,
+        timeout=PROPOSAL_TIMEOUT_SECONDS,
+        env=env,
+        # Outside the repo, so no CLAUDE.md is picked up as context
+        cwd=tempfile.gettempdir(),
+        check=False,
     )
-    if response.parsed_output is None:
-        raise RuntimeError(f"resposta sem proposta (stop_reason={response.stop_reason})")
-    return response.parsed_output
+    # The CLI prints its JSON result on failure too, e.g. an expired token's 401
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        output = {}
+    if result.returncode != 0 or output.get("is_error") or output.get("structured_output") is None:
+        raise ProposalError(
+            f"claude saiu com código {result.returncode} (subtype={output.get('subtype')}, "
+            f"api_error_status={output.get('api_error_status')})"
+        )
+    return Proposal.model_validate(output["structured_output"])
 
 
 def format_notification(
@@ -266,19 +293,17 @@ def main() -> None:
         print("Nenhuma keyword configurada em KEYWORDS no .env", file=sys.stderr)
         sys.exit(1)
 
-    api_key = env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     prompt_key = env.get("PROMPT_KEY") or os.environ.get("PROMPT_KEY")
-    client = system = None
-    if api_key and prompt_key and PROMPT_FILE.exists():
-        try:
-            system = load_prompt(prompt_key)
-            client = anthropic.Anthropic(
-                api_key=api_key,
-                timeout=PROPOSAL_TIMEOUT_SECONDS,
-                max_retries=PROPOSAL_MAX_RETRIES,
-            )
-        except (InvalidToken, ValueError) as exc:
-            print(f"PROMPT_KEY inválida, seguindo sem propostas: {exc!r}", file=sys.stderr)
+    system = None
+    if oauth_token and prompt_key and PROMPT_FILE.exists():
+        if shutil.which("claude") is None:
+            print("Claude Code não instalado, seguindo sem propostas", file=sys.stderr)
+        else:
+            try:
+                system = load_prompt(prompt_key)
+            except (InvalidToken, ValueError) as exc:
+                print(f"PROMPT_KEY inválida, seguindo sem propostas: {exc!r}", file=sys.stderr)
 
     seen = load_seen()
     pending = load_pending()
@@ -306,7 +331,7 @@ def main() -> None:
     try:
         for project in candidates:
             proposal = error = None
-            if client and system:
+            if system:
                 if proposals_left <= 0 or time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
                     # Out of budget: stays pending instead of alerting without a proposal
                     deferred += 1
@@ -314,15 +339,13 @@ def main() -> None:
                 proposals_left -= 1
                 try:
                     description = fetch_description(project["url"])
-                    proposal = generate_proposal(client, system, project, description)
+                    proposal = generate_proposal(oauth_token, system, project, description)
                 except Exception as exc:  # noqa: BLE001
-                    # Broad on purpose: a proposal error must never crash the run. Only the
-                    # type is logged: Actions logs are public and a validation error
-                    # would echo the model output.
-                    print(
-                        f"Falha na proposta de {project['url']}: {type(exc).__name__}",
-                        file=sys.stderr,
-                    )
+                    # Broad on purpose: a proposal error must never crash the run. Actions
+                    # logs are public and a validation error would echo the model output,
+                    # so only ProposalError, built to be safe, is logged in full.
+                    detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
+                    print(f"Falha na proposta de {project['url']}: {detail}", file=sys.stderr)
                     project["attempts"] += 1
                     if project["attempts"] < MAX_PROPOSAL_ATTEMPTS:
                         pending[project["id"]] = _pending_entry(project)
