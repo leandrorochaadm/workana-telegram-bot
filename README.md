@@ -14,7 +14,7 @@ Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
 - Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`)
-- Variable: `KEYWORDS` (ex: `aplicativo,app`)
+- Variables: `KEYWORDS` (ex: `aplicativo,app`) e, opcional, `EXCLUDE_KEYWORDS` (ex: `jogo,wordpress,no code`)
 
 Para trocar as palavras-chave:
 
@@ -26,6 +26,25 @@ A cada execução o workflow faz commit do `seen.json` e do `pending.json`. Rode
 
 Não ative o launchd junto com o GitHub Actions: cada um tem seu próprio `seen.json`
 e você receberia avisos repetidos.
+
+### Palavras bloqueadas
+
+`EXCLUDE_KEYWORDS` lista palavras que descartam a vaga, separadas por vírgula. Para criar ou trocar:
+
+```
+gh variable set EXCLUDE_KEYWORDS --body "jogo,game,manutenção,wordpress,no code,low code"
+```
+
+Como o filtro funciona:
+- Olha só o **título** da vaga, não a descrição.
+- Vence o `KEYWORDS`: "App de jogo" é descartado mesmo tendo "app".
+- Vale também para vagas que já estavam na fila (`pending.json`).
+- A vaga descartada vai para o `seen.json`: não chega no Telegram nem gasta proposta.
+- Mesma regra do `KEYWORDS`: palavra inteira, sem diferenciar maiúscula de minúscula,
+  e o plural com "s" também conta (`jogo` barra "jogos", mas não "joguinho").
+- Um espaço na palavra também pega hífen ou as palavras juntas: `no code` barra "no-code" e "nocode".
+  Isso vale para o `KEYWORDS` também.
+- Variável vazia ou ausente: nada é filtrado.
 
 ### Agendamento com Cloudflare Worker
 
@@ -136,6 +155,7 @@ Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
    - `TELEGRAM_TOKEN`: token do bot (criado via @BotFather)
    - `TELEGRAM_CHAT_ID`: chat_id de destino
    - `KEYWORDS`: palavras separadas por vírgula (ex: `aplicativo,app`)
+   - `EXCLUDE_KEYWORDS`: opcional, palavras que descartam a vaga (ex: `jogo,wordpress,no code`)
    - `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`:
      opcionais, para gerar propostas (exige o
      Claude Code instalado: `npm install -g @anthropic-ai/claude-code@2.1.282`)

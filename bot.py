@@ -544,7 +544,9 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
 
 
 def matches_keywords(title: str, keywords: list[str]) -> bool:
-    return any(re.search(rf"\b{re.escape(kw)}s?\b", title, re.IGNORECASE) for kw in keywords)
+    # A space in a keyword also matches a hyphen or nothing: "no code", "no-code", "nocode"
+    patterns = (re.escape(kw).replace(r"\ ", r"[\s-]?") for kw in keywords)
+    return any(re.search(rf"\b{pattern}s?\b", title, re.IGNORECASE) for pattern in patterns)
 
 
 def send_telegram(token: str, chat_id: str, text: str, html_mode: bool = True) -> None:
@@ -567,6 +569,8 @@ def main() -> None:
     chat_id = env.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
     keywords_raw = env.get("KEYWORDS") or os.environ.get("KEYWORDS", "")
     keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    excluded_raw = env.get("EXCLUDE_KEYWORDS") or os.environ.get("EXCLUDE_KEYWORDS", "")
+    excluded = [k.strip() for k in excluded_raw.split(",") if k.strip()]
 
     if not token or not chat_id:
         print("Faltam TELEGRAM_TOKEN e/ou TELEGRAM_CHAT_ID no .env", file=sys.stderr)
@@ -614,6 +618,11 @@ def main() -> None:
             pending[project["id"]] = _pending_entry({**project, "attempts": 0})
         else:
             seen.add(project["id"])
+    # Also drops jobs queued before a word was excluded
+    for pid, job in list(pending.items()):
+        if matches_keywords(job["title"], excluded):
+            pending.pop(pid)
+            seen.add(pid)
     save_state()
     # dicts keep insertion order, so this is oldest first
     candidates = [{"id": pid, **job} for pid, job in pending.items()]

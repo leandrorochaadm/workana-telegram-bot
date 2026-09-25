@@ -38,6 +38,17 @@ def test_matches_keywords_escapes_special_chars() -> None:
     assert bot.matches_keywords("Vaga para node.js", ["node.js"]) is True
 
 
+@pytest.mark.parametrize(
+    "title", ["App no code", "App No-Code", "App nocode", "Apps low codes"]
+)
+def test_matches_keywords_space_matches_hyphen_or_nothing(title: str) -> None:
+    assert bot.matches_keywords(title, ["no code", "low code"]) is True
+
+
+def test_matches_keywords_empty_list_matches_nothing() -> None:
+    assert bot.matches_keywords("App de jogo", []) is False
+
+
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "ENV_FILE", tmp_path / ".env")
@@ -45,8 +56,8 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "PENDING_FILE", tmp_path / "pending.json")
     monkeypatch.setattr(bot, "PROMPT_FILE", tmp_path / "proposal_prompt.enc")
     for var in (
-        "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY",
-        "PRICE_HOURLY_RATE", "PRICE_MIN_PROJECT",
+        "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
+        "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY", "PRICE_HOURLY_RATE", "PRICE_MIN_PROJECT",
     ):
         monkeypatch.delenv(var, raising=False)
     (tmp_path / ".env").write_text(
@@ -142,6 +153,24 @@ def test_main_saves_seen_when_fetch_succeeds_but_send_crashes(workdir, monkeypat
         bot.main()
 
     assert bot.load_seen() == {"site"}
+
+
+def test_main_skips_excluded_jobs_including_queued_ones(workdir, sent, monkeypatch) -> None:
+    with bot.ENV_FILE.open("a") as f:
+        f.write("EXCLUDE_KEYWORDS=jogo, wordpress ,\n")
+    bot.save_pending({"old": {"title": "App de jogo", "url": "u", "attempts": 1}})
+    monkeypatch.setattr(
+        bot,
+        "fetch_projects",
+        lambda: [_project("wp", "App WordPress"), _project("ok", "App de delivery")],
+    )
+
+    bot.main()
+
+    assert len(sent) == 1
+    assert "App de delivery" in sent[0]
+    assert bot.load_seen() == {"old", "wp", "ok"}
+    assert bot.load_pending() == {}
 
 
 def test_main_exits_without_credentials(workdir) -> None:
