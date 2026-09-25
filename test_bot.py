@@ -54,6 +54,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(bot, "SEEN_FILE", tmp_path / "seen.json")
     monkeypatch.setattr(bot, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(bot, "REJECTED_FILE", tmp_path / "rejected.json")
     monkeypatch.setattr(bot, "PROMPT_FILE", tmp_path / "proposal_prompt.enc")
     for var in (
         "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
@@ -225,7 +226,15 @@ def with_proposals(workdir, monkeypatch):
             raise ValueError("saída do modelo com texto sigiloso")
         return PROPOSAL
 
+    def fake_check_fit(_token, project, _description):
+        if "logo" in project["title"]:
+            return bot.JobFit(is_match=False, reason="Pede só a criação de um logo.")
+        if "triagem" in project["title"]:
+            raise ValueError("saída do modelo com texto sigiloso")
+        return bot.JobFit(is_match=True, reason="App mobile.")
+
     monkeypatch.setattr(bot, "fetch_description", lambda url: f"descrição de {url}")
+    monkeypatch.setattr(bot, "check_fit", fake_check_fit)
     monkeypatch.setattr(bot, "generate_proposal", fake_generate)
     monkeypatch.setattr(bot.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
     return calls
@@ -292,6 +301,71 @@ def test_main_caps_proposals_per_run(with_proposals, sent, monkeypatch) -> None:
     assert len(sent) == 2  # alert + proposal for "a" only
     assert bot.load_seen() == {"a"}
     assert bot.load_pending() == {"b": {"title": "App b", "url": "https://www.workana.com/job/b", "attempts": 0}}
+
+
+def test_main_sends_rejected_job_without_proposal(with_proposals, sent, monkeypatch) -> None:
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App de logo")])
+
+    bot.main()
+
+    assert with_proposals == []
+    assert len(sent) == 1
+    assert "Fora do seu perfil" in sent[0] and "Pede só a criação de um logo." in sent[0]
+    assert bot.load_seen() == {"x"}
+    assert bot.load_pending() == {}
+    [(pid, job)] = bot.load_rejected().items()
+    assert pid == "x"
+    assert job["reason"] == "Pede só a criação de um logo."
+    assert job["url"] == "https://www.workana.com/job/x" and job["date"]
+
+
+def test_main_does_not_queue_rejected_job_when_send_fails(with_proposals, monkeypatch) -> None:
+    def fake_send(*_args, **_kwargs):
+        raise requests.ConnectionError("fora do ar")
+
+    monkeypatch.setattr(bot, "send_telegram", fake_send)
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App de logo")])
+
+    with pytest.raises(SystemExit):
+        bot.main()
+
+    assert bot.load_seen() == {"x"}
+    assert bot.load_pending() == {}
+    assert "x" in bot.load_rejected()
+
+
+def test_main_rejected_job_keeps_proposal_budget(with_proposals, sent, monkeypatch) -> None:
+    monkeypatch.setattr(bot, "MAX_PROPOSALS_PER_RUN", 1)
+    monkeypatch.setattr(
+        bot, "fetch_projects", lambda: [_project("a", "App de logo"), _project("b", "App b")]
+    )
+
+    bot.main()
+
+    assert len(with_proposals) == 1
+    assert bot.load_seen() == {"a", "b"}
+
+
+def test_triage_names_rejection_without_reason(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot, "check_fit", lambda *_args: bot.JobFit(is_match=False, reason="  ")
+    )
+
+    assert bot.triage("tok", _project("x", "Site"), "descrição") == "sem motivo informado"
+
+
+def test_main_generates_proposal_when_triage_fails(
+    with_proposals, sent, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App triagem")])
+
+    bot.main()
+
+    assert len(with_proposals) == 1
+    assert len(sent) == 2
+    err = capsys.readouterr().err
+    assert "Triagem falhou" in err and "ValueError" in err
+    assert "sigiloso" not in err
 
 
 def test_main_skips_proposals_with_wrong_key(with_proposals, sent, monkeypatch) -> None:
@@ -441,6 +515,7 @@ def test_generate_proposal_sends_prompt_and_job(monkeypatch, rates) -> None:
     cmd = calls[0]["cmd"]
     assert cmd[:2] == ["claude", "-p"]
     assert cmd[cmd.index("--model") + 1] == bot.PROPOSAL_MODEL
+    assert cmd[cmd.index("--effort") + 1] == "high"
     assert cmd[cmd.index("--system-prompt") + 1] == "prompt"
     assert json.loads(cmd[cmd.index("--json-schema") + 1]) == bot.ProposalDraft.model_json_schema()
     content = calls[0]["input"]
@@ -450,6 +525,23 @@ def test_generate_proposal_sends_prompt_and_job(monkeypatch, rates) -> None:
     env = calls[0]["env"]
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
     assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_check_fit_asks_haiku_with_job(monkeypatch) -> None:
+    calls = _fake_claude(
+        monkeypatch, output={"structured_output": {"is_match": False, "reason": "Landing page."}}
+    )
+
+    fit = bot.check_fit("tok", _project("x", "Site novo"), "descrição")
+
+    assert fit == bot.JobFit(is_match=False, reason="Landing page.")
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--model") + 1] == bot.FIT_MODEL
+    assert "--effort" not in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == bot.FIT_PROMPT
+    assert json.loads(cmd[cmd.index("--json-schema") + 1]) == bot.JobFit.model_json_schema()
+    assert "Site novo" in calls[0]["input"] and "descrição" in calls[0]["input"]
+    assert calls[0]["timeout"] == bot.FIT_TIMEOUT_SECONDS
 
 
 def _answer(**overrides) -> dict:

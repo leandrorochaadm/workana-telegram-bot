@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,6 +37,8 @@ ENV_FILE = BASE_DIR / ".env"
 SEEN_FILE = BASE_DIR / "seen.json"
 # Matched jobs still waiting for a proposal: {id: {"title", "url", "attempts"}}
 PENDING_FILE = BASE_DIR / "pending.json"
+# Jobs the triage turned down, kept to tune FIT_PROMPT: {id: {"title", "url", "reason", "date"}}
+REJECTED_FILE = BASE_DIR / "rejected.json"
 # Encrypted because the repo is public and the prompt holds private pricing rules
 PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
 
@@ -54,14 +57,30 @@ USER_AGENT = (
 )
 
 PROPOSAL_MODEL = "claude-opus-5-5"
+# Cheap first pass so the Opus call is spent only on jobs that fit the work offered
+FIT_MODEL = "claude-haiku-4-5-20251001"
+FIT_TIMEOUT_SECONDS = 60
+FIT_PROMPT = """Você faz a triagem de vagas da Workana para um desenvolvedor freelancer.
+Ele aceita vagas para desenvolver software com telas: aplicativo mobile (Android, iOS,
+multiplataforma) ou sistema web (SaaS, painel, plataforma, área logada), do zero ou evoluindo
+um que já existe.
+
+Ele não aceita: landing page, site institucional, blog, loja montada em plataforma pronta
+(Shopify, WordPress, Wix, Nuvemshop), só design ou protótipo (UI/UX, Figma), bot, automação,
+integração ou scraping sem telas, planilha, tráfego pago, marketing, conteúdo, vídeo, suporte
+de TI, vaga de emprego fixo ou revenda de app pronto.
+
+Leia a vaga e diga se ela dá match. Na dúvida, quando a vaga pode ser um app ou sistema com
+telas, responda que dá match. Em reason, explique em uma frase curta, em português, o que a
+vaga pede."""
 # Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, the
-# deadline below, then one last proposal (job page + one Claude call) and the commit.
+# deadline below, then one last job (page + Haiku triage + one Opus call) and the commit.
 # Revisions only start before the deadline, so they never add a call past it.
 PROPOSAL_TIMEOUT_SECONDS = 180
 PAGE_TIMEOUT_MS = 30_000
-PROPOSAL_DEADLINE_SECONDS = 8 * 60
+PROPOSAL_DEADLINE_SECONDS = 7 * 60
 # A job that keeps failing (refusal, page gone) is sent without a proposal after
 # this many tries, so it cannot bill every run forever
 MAX_PROPOSAL_ATTEMPTS = 3
@@ -72,6 +91,13 @@ TELEGRAM_MAX_CHARS = 4096
 
 class ProposalError(Exception):
     """A failure whose message is safe for public logs: it never holds model output."""
+
+
+class JobFit(BaseModel):
+    """The Haiku triage answer: whether the job is worth a proposal, and why."""
+
+    is_match: bool
+    reason: str
 
 
 class ProposalDraft(BaseModel):
@@ -210,6 +236,16 @@ def load_pending() -> dict[str, dict]:
 
 def save_pending(pending: dict[str, dict]) -> None:
     PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
+
+
+def load_rejected() -> dict[str, dict]:
+    if REJECTED_FILE.exists():
+        return json.loads(REJECTED_FILE.read_text())
+    return {}
+
+
+def save_rejected(rejected: dict[str, dict]) -> None:
+    REJECTED_FILE.write_text(json.dumps(rejected, ensure_ascii=False, indent=2))
 
 
 @contextmanager
@@ -426,6 +462,23 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
     )
 
 
+def job_content(project: dict[str, str], description: str) -> str:
+    return f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n{description}\n</vaga>"
+
+
+def check_fit(oauth_token: str, project: dict[str, str], description: str) -> JobFit:
+    """Asks Haiku whether the job is an app or web system, before the Opus proposal."""
+    output = call_claude(
+        oauth_token,
+        FIT_PROMPT,
+        job_content(project, description),
+        model=FIT_MODEL,
+        schema=JobFit,
+        timeout=FIT_TIMEOUT_SECONDS,
+    )
+    return JobFit.model_validate(output)
+
+
 def load_prompt(key: str) -> str:
     return Fernet(key.encode()).decrypt(PROMPT_FILE.read_bytes()).decode()
 
@@ -441,7 +494,7 @@ def generate_proposal(
 
     Whatever is left after the last revision still goes out, listed in the alert.
     """
-    job = f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n{description}\n</vaga>"
+    job = job_content(project, description)
     draft = run_claude(oauth_token, system, job)
     # The latest draft whose markers are right: a revision that breaks them, or a
     # revision call that fails, must not throw away a proposal that could go out
@@ -469,28 +522,55 @@ def generate_proposal(
 
 
 def run_claude(oauth_token: str, system: str, content: str) -> ProposalDraft:
-    """Runs Claude Code in print mode, billed to the Max plan behind `oauth_token`."""
+    output = call_claude(
+        oauth_token,
+        system,
+        content,
+        model=PROPOSAL_MODEL,
+        schema=ProposalDraft,
+        timeout=PROPOSAL_TIMEOUT_SECONDS,
+        effort="high",
+    )
+    return ProposalDraft.model_validate(output)
+
+
+def call_claude(
+    oauth_token: str,
+    system: str,
+    content: str,
+    *,
+    model: str,
+    schema: type[BaseModel],
+    timeout: int,
+    effort: str | None = None,
+) -> dict:
+    """Runs Claude Code in print mode, billed to the Max plan behind `oauth_token`.
+
+    Returns the structured output, still unvalidated.
+    """
     # Without the API key, the CLI cannot fall back to pay-per-use billing
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    # The triage is a plain yes or no, so it runs at the model's default effort
+    effort_args = ["--effort", effort] if effort else []
     result = subprocess.run(
         [
             "claude",
             "-p",
-            "--model", PROPOSAL_MODEL,
-            "--effort", "high",
+            "--model", model,
+            *effort_args,
             "--system-prompt", system,
             # A plain answer: no tools, no settings, no saved session
             "--tools", "",
             "--setting-sources", "",
             "--no-session-persistence",
             "--output-format", "json",
-            "--json-schema", json.dumps(ProposalDraft.model_json_schema()),
+            "--json-schema", json.dumps(schema.model_json_schema()),
         ],
         input=content,
         capture_output=True,
         text=True,
-        timeout=PROPOSAL_TIMEOUT_SECONDS,
+        timeout=timeout,
         env=env,
         # Outside the repo, so no CLAUDE.md is picked up as context
         cwd=tempfile.gettempdir(),
@@ -506,11 +586,14 @@ def run_claude(oauth_token: str, system: str, content: str) -> ProposalDraft:
             f"claude saiu com código {result.returncode} (subtype={output.get('subtype')}, "
             f"api_error_status={output.get('api_error_status')})"
         )
-    return ProposalDraft.model_validate(output["structured_output"])
+    return output["structured_output"]
 
 
 def format_notification(
-    project: dict[str, str], proposal: Proposal | None, error: str | None
+    project: dict[str, str],
+    proposal: Proposal | None,
+    error: str | None,
+    rejection: str | None = None,
 ) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
     if proposal:
@@ -525,6 +608,8 @@ def format_notification(
             text += "\n\n🔎 <b>Varredura:</b>" + "".join(
                 f"\n• {html.escape(item)}" for item in proposal.review
             )
+    elif rejection:
+        text += f"\n\n🚫 Fora do seu perfil, sem proposta: {html.escape(rejection)}"
     elif error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
@@ -602,12 +687,14 @@ def main() -> None:
 
     seen = load_seen()
     pending = load_pending()
+    rejected = load_rejected()
     projects = fetch_projects()
     proposals_left = MAX_PROPOSALS_PER_RUN
 
     def save_state() -> None:
         save_seen(seen)
         save_pending(pending)
+        save_rejected(rejected)
 
     # New matches are queued (and saved) before any work, so a run killed mid-way
     # cannot lose a job that has already left the listing page
@@ -627,25 +714,28 @@ def main() -> None:
     # dicts keep insertion order, so this is oldest first
     candidates = [{"id": pid, **job} for pid, job in pending.items()]
 
-    sent = failed = deferred = 0
+    sent = failed = deferred = turned_down = 0
     try:
         for project in candidates:
-            proposal = error = None
+            proposal = error = rejection = None
             if system:
                 if proposals_left <= 0 or time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
                     # Out of budget: stays pending instead of alerting without a proposal
                     deferred += 1
                     continue
-                proposals_left -= 1
                 try:
                     description = fetch_description(project["url"])
-                    proposal = generate_proposal(
-                        oauth_token,
-                        system,
-                        project,
-                        description,
-                        can_revise=lambda: time.monotonic() - started <= PROPOSAL_DEADLINE_SECONDS,
-                    )
+                    rejection = triage(oauth_token, project, description)
+                    if rejection is None:
+                        proposals_left -= 1
+                        proposal = generate_proposal(
+                            oauth_token,
+                            system,
+                            project,
+                            description,
+                            can_revise=lambda: time.monotonic() - started
+                            <= PROPOSAL_DEADLINE_SECONDS,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     # Broad on purpose: a proposal error must never crash the run. Actions
                     # logs are public and a validation error would echo the model output,
@@ -659,19 +749,36 @@ def main() -> None:
                         deferred += 1
                         continue
                     error = "erro ao ler a vaga ou falar com o Claude"
+            if rejection is not None:
+                # Saved before the alert, so a failed send cannot queue the job for another try
+                rejected[project["id"]] = {
+                    "title": project["title"],
+                    "url": project["url"],
+                    "reason": rejection,
+                    "date": datetime.now(UTC).date().isoformat(),
+                }
+                seen.add(project["id"])
+                pending.pop(project["id"], None)
+                save_state()
+                turned_down += 1
             try:
-                send_telegram(token, chat_id, format_notification(project, proposal, error))
+                send_telegram(
+                    token, chat_id, format_notification(project, proposal, error, rejection)
+                )
                 if proposal:
                     # Plain text, alone in its message, so a long-press copies it whole
                     for chunk in split_message(proposal.proposal):
                         send_telegram(token, chat_id, chunk, html_mode=False)
             except requests.RequestException as exc:
-                # Stays pending: the next run re-sends it, proposal included, rather
-                # than leaving an alert whose proposal never arrived
                 failed += 1
-                pending[project["id"]] = _pending_entry(project)
-                save_state()
                 print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
+                if rejection is None:
+                    # Stays pending: the next run re-sends it, proposal included, rather
+                    # than leaving an alert whose proposal never arrived
+                    pending[project["id"]] = _pending_entry(project)
+                    save_state()
+                continue
+            if rejection is not None:
                 continue
             seen.add(project["id"])
             pending.pop(project["id"], None)
@@ -682,11 +789,29 @@ def main() -> None:
         save_state()
 
     print(
-        f"{len(projects)} projetos lidos, {sent} enviados, "
+        f"{len(projects)} projetos lidos, {sent} enviados, {turned_down} rejeitados na triagem, "
         f"{deferred} adiados, {failed} com falha."
     )
     if failed:
         sys.exit(1)
+
+
+def triage(oauth_token: str, project: dict[str, str], description: str) -> str | None:
+    """The reason the job was rejected, or None when it deserves a proposal.
+
+    Fails open: a triage error must not cost a job that could fit.
+    """
+    try:
+        fit = check_fit(oauth_token, project, description)
+    except Exception as exc:  # noqa: BLE001
+        # Same rule as the proposal: only ProposalError is safe for the public logs
+        detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
+        print(f"Triagem falhou em {project['url']}, gerando proposta: {detail}", file=sys.stderr)
+        return None
+    if fit.is_match:
+        return None
+    # An empty reason would read as a plain alert, hiding that the job was rejected
+    return fit.reason.strip() or "sem motivo informado"
 
 
 def _pending_entry(project: dict) -> dict:

@@ -61,7 +61,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json pending.json
+          git add seen.json pending.json rejected.json
           git diff --cached --quiet && exit 0
           git commit -m "chore: update seen projects"
           # a push made during this run would otherwise reject ours and lose sent projects

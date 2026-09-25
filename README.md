@@ -22,7 +22,7 @@ Para trocar as palavras-chave:
 gh variable set KEYWORDS --body "aplicativo,app,flutter"
 ```
 
-A cada execução o workflow faz commit do `seen.json` e do `pending.json`. Rode `git pull` antes de editar localmente.
+A cada execução o workflow faz commit do `seen.json`, do `pending.json` e do `rejected.json`. Rode `git pull` antes de editar localmente.
 
 Não ative o launchd junto com o GitHub Actions: cada um tem seu próprio `seen.json`
 e você receberia avisos repetidos.
@@ -70,8 +70,15 @@ Para cada vaga que bate com as palavras-chave, o bot abre a página, lê a descr
 Claude (`claude-opus-5-5`) uma proposta. Chegam duas mensagens: uma com título, link, preço,
 prazo, piso de negociação e observações; outra só com o texto da proposta, para copiar.
 
-- A vaga só é avisada junto com a proposta. Se passar do limite de `MAX_PROPOSALS_PER_RUN` (5)
-  propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
+- Antes da proposta, o Haiku (`claude-haiku-4-5-20251001`) faz uma triagem: a vaga precisa ser
+  um app mobile ou um sistema web com telas. Landing page, site, loja pronta, só design, bot,
+  automação etc. chegam no Telegram com o motivo e sem proposta, e não gastam o limite de
+  propostas da execução. A vaga rejeitada vai para o `seen.json` e para o `rejected.json`
+  (título, link, motivo e data, para ajustar os critérios) e nunca é tentada de novo, nem se
+  o aviso falhar. Se a triagem falhar, a proposta é gerada mesmo assim. Os critérios
+  ficam em `FIT_PROMPT`, no `bot.py`.
+- A vaga que passa na triagem só é avisada junto com a proposta. Se passar do limite de
+  `MAX_PROPOSALS_PER_RUN` (5) propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
   tentada de novo na próxima execução, mesmo que já tenha saído da lista da Workana.
 - Depois de `MAX_PROPOSAL_ATTEMPTS` (3) falhas, a vaga chega sem proposta, com um aviso.
 - Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`
@@ -223,5 +230,6 @@ comando `claude` e segue sem propostas ("Claude Code não instalado" no `.err.lo
 - Percorre até 5 páginas de cada busca (7 vagas por página), abrindo cada página numa sessão
   limpa do navegador, porque a Cloudflare bloqueia o segundo carregamento na mesma sessão.
 - Mantém `seen.json` com os IDs de projetos já processados, para não notificar duas vezes, e
-  `pending.json` com as vagas que ainda esperam proposta.
+  `pending.json` com as vagas que ainda esperam proposta. O `rejected.json` guarda as vagas que a
+  triagem rejeitou.
 - Roda a cada 15 minutos via GitHub Actions, disparado pelo Cloudflare Worker (ou launchd, se rodar localmente).
