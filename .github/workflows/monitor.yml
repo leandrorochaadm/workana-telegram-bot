@@ -19,7 +19,8 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Under the 15-min dispatch interval; bot.py's PROPOSAL_* limits are sized to fit it
+    timeout-minutes: 14
     steps:
       - uses: actions/checkout@v7
 
@@ -44,6 +45,8 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KEYWORDS: ${{ vars.KEYWORDS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROMPT_KEY: ${{ secrets.PROMPT_KEY }}
         run: uv run --script bot.py
 
       - name: Save seen projects
@@ -51,7 +54,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json
+          git add seen.json pending.json
           git diff --cached --quiet && exit 0
           git commit -m "chore: update seen projects"
           # a push made during this run would otherwise reject ours and lose sent projects

@@ -1,7 +1,8 @@
 # Workana Telegram Bot
 
 Monitora projetos novos na Workana (categoria TI e Programação, ordenados por mais recentes),
-filtra por palavras-chave no título e avisa no Telegram.
+filtra por palavras-chave no título e avisa no Telegram. Opcionalmente, lê a descrição de cada
+vaga e gera uma proposta com o Claude (ver [Propostas com o Claude](#propostas-com-o-claude)).
 
 ## Execução no GitHub Actions (principal)
 
@@ -11,7 +12,7 @@ Como reserva, o próprio workflow roda de hora em hora (minuto 41), caso o Worke
 Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
-- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
+- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `ANTHROPIC_API_KEY` e `PROMPT_KEY`)
 - Variable: `KEYWORDS` (ex: `aplicativo,app`)
 
 Para trocar as palavras-chave:
@@ -20,7 +21,7 @@ Para trocar as palavras-chave:
 gh variable set KEYWORDS --body "aplicativo,app,flutter"
 ```
 
-A cada execução o workflow faz commit do `seen.json`. Rode `git pull` antes de editar localmente.
+A cada execução o workflow faz commit do `seen.json` e do `pending.json`. Rode `git pull` antes de editar localmente.
 
 Não ative o launchd junto com o GitHub Actions: cada um tem seu próprio `seen.json`
 e você receberia avisos repetidos.
@@ -43,12 +44,39 @@ de Brasília (o cron da Cloudflare só roda a cada 15 min em UTC; o código deci
 
 O token expira (no máximo em 1 ano). Ao renovar, rode `npx wrangler secret put GITHUB_TOKEN` de novo.
 
+## Propostas com o Claude
+
+Para cada vaga que bate com as palavras-chave, o bot abre a página, lê a descrição e pede ao
+Claude (`claude-opus-5-5`) uma proposta. Chegam duas mensagens: uma com título, link, preço,
+prazo, piso de negociação e observações; outra só com o texto da proposta, para copiar.
+
+- A vaga só é avisada junto com a proposta. Se passar do limite de `MAX_PROPOSALS_PER_RUN` (5)
+  propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
+  tentada de novo na próxima execução, mesmo que já tenha saído da lista da Workana.
+- Depois de `MAX_PROPOSAL_ATTEMPTS` (3) falhas, a vaga chega sem proposta, com um aviso.
+- Sem `ANTHROPIC_API_KEY` ou `PROMPT_KEY`, o bot funciona como antes, só com o aviso.
+
+O prompt tem regras de preço privadas e o repositório é público, por isso só a versão
+criptografada (`proposal_prompt.enc`) é commitada. O texto puro fica em `proposal_prompt.md`,
+que está no `.gitignore`. Para alterar o prompt:
+
+```
+# edite proposal_prompt.md, depois:
+PROMPT_KEY=<sua chave> ./encrypt_prompt.py
+git add proposal_prompt.enc && git commit -m "chore: update proposal prompt"
+```
+
+Sem `PROMPT_KEY`, o script gera uma chave nova; cadastre-a com `gh secret set PROMPT_KEY`.
+
+Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
+
 ## Setup local
 
 1. Copie `.env.example` para `.env` e preencha:
    - `TELEGRAM_TOKEN`: token do bot (criado via @BotFather)
    - `TELEGRAM_CHAT_ID`: chat_id de destino
    - `KEYWORDS`: palavras separadas por vírgula (ex: `aplicativo,app`)
+   - `ANTHROPIC_API_KEY` e `PROMPT_KEY`: opcionais, para gerar propostas
 
 2. Instale o Chromium do Playwright (uma vez só):
    ```
@@ -64,7 +92,7 @@ O token expira (no máximo em 1 ano). Ao renovar, rode `npx wrangler secret put 
 ## Testes
 
 ```
-uv run --with pytest --with playwright==1.63.0 --with requests pytest -q
+uv run --with pytest --with playwright==1.63.0 --with requests --with anthropic --with cryptography pytest -q
 ```
 
 ## Agendamento local (launchd, macOS, alternativa ao GitHub Actions)

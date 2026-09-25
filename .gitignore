@@ -3,3 +3,5 @@ bot.log
 bot.err.log
 __pycache__/
 .pytest_cache/
+# Plain-text proposal prompt: holds private pricing, only the .enc is committed
+proposal_prompt.md
