@@ -10,5 +10,11 @@
     "url": "https://www.workana.com/job/desenvolvimento-de-sites-aplicativos-e-catalogos-digitais-para-vendas",
     "reason": "A vaga é muito genérica envolvendo \"sites, aplicativos e catálogos para vendas\" com WordPress como skill necessária, sugerindo desenvolvimento em plataforma pronta ou loja em WordPress, o que não é aceito. Falta clareza se será um app ou sistema customizado com telas.",
     "date": "2026-09-26"
+  },
+  "https://www.workana.com/job/desenvolvedor-para-publicacao-e-gerenciamento-de-apps-na-play-store": {
+    "title": "Desenvolvedor para Publicação e Gerenciamento de Apps na Play Store",
+    "url": "https://www.workana.com/job/desenvolvedor-para-publicacao-e-gerenciamento-de-apps-na-play-store",
+    "reason": "Vaga sobre gerenciamento, publicação e configuração de apps na Play Store, não desenvolvimento de software com telas; envolve mais operações/suporte do que desenvolvimento real.",
+    "date": "2026-09-26"
   }
 }
