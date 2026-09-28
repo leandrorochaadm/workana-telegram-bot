@@ -52,7 +52,8 @@ WORKANA_URLS = (
     "https://www.workana.com/jobs?language=pt&publication=1d&query=app&region=029%2C013%2C005",
 )
 JOB_LINK_SELECTOR = "a[href^='/job/']"
-NO_RESULTS_TEXT = "Não foram encontrados projetos"
+# The site language follows the exit IP too (WARP may land in a Spanish-speaking region)
+NO_RESULTS_TEXT = re.compile(r"Não foram encontrados projetos|No hay proyectos")
 # Logged-out listings show 7 jobs per page, sorted by relevance, not by date
 MAX_PAGES_PER_SEARCH = 5
 USER_AGENT = (
@@ -266,7 +267,7 @@ def open_browser() -> Iterator[Browser]:
 @contextmanager
 def fresh_page(browser: Browser) -> Iterator[Page]:
     """A page in its own context, so no cookies carry over between loads."""
-    context = browser.new_context(user_agent=USER_AGENT)
+    context = browser.new_context(user_agent=USER_AGENT, locale="pt-BR")
     try:
         yield context.new_page()
     finally:
