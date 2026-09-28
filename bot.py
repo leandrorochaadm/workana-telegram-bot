@@ -27,6 +27,7 @@ from pathlib import Path
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
 import preco
@@ -41,6 +42,9 @@ PENDING_FILE = BASE_DIR / "pending.json"
 REJECTED_FILE = BASE_DIR / "rejected.json"
 # Encrypted because the repo is public and the prompt holds private pricing rules
 PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
+# Listing that timed out (screenshot + HTML), uploaded by the workflow
+# to tell a Cloudflare block from a layout change
+DEBUG_DIR = BASE_DIR / "debug"
 
 # Jobs from the last 24h; a job listed by both searches is kept once
 WORKANA_URLS = (
@@ -299,9 +303,13 @@ def _fetch_listing_page(
     with fresh_page(browser) as page:
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         # A 24h search can legitimately come back empty; a Cloudflare block still times out
-        page.locator(JOB_LINK_SELECTOR).or_(page.get_by_text(NO_RESULTS_TEXT)).first.wait_for(
-            timeout=60_000
-        )
+        try:
+            page.locator(JOB_LINK_SELECTOR).or_(page.get_by_text(NO_RESULTS_TEXT)).first.wait_for(
+                timeout=60_000
+            )
+        except PlaywrightTimeoutError:
+            _dump_page(page)
+            raise
         for link in page.query_selector_all(JOB_LINK_SELECTOR):
             href = link.get_attribute("href") or ""
             span = link.query_selector("span[title]")
@@ -311,6 +319,19 @@ def _fetch_listing_page(
             job_url = f"https://www.workana.com{href.split('?')[0]}"
             projects.setdefault(job_url, {"id": job_url, "title": title, "url": job_url})
         return page.query_selector(f"ul.pagination a[href$='page={page_number + 1}']") is not None
+
+
+def _dump_page(page: Page) -> None:
+    """Saves what the browser was showing; never masks the original error."""
+    try:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        page.screenshot(path=DEBUG_DIR / f"listing-{stamp}.png", full_page=True)
+        (DEBUG_DIR / f"listing-{stamp}.html").write_text(
+            f"<!-- {page.url} | title: {page.title()} -->\n{page.content()}"
+        )
+    except Exception as error:
+        print(f"Não foi possível salvar a página para diagnóstico: {error}", file=sys.stderr)
 
 
 def fetch_description(url: str) -> str:

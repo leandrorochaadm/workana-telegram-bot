@@ -56,6 +56,15 @@ jobs:
           PRICE_MIN_PROJECT: ${{ secrets.PRICE_MIN_PROJECT }}
         run: uv run --script bot.py
 
+      - name: Upload debug page
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: debug-page
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Save seen projects
         if: always()
         run: |
