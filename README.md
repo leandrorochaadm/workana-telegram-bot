@@ -229,6 +229,10 @@ comando `claude` e segue sem propostas ("Claude Code não instalado" no `.err.lo
   e bloqueia requisições HTTP simples (curl/requests puro).
 - Percorre até 5 páginas de cada busca (7 vagas por página), abrindo cada página numa sessão
   limpa do navegador, porque a Cloudflare bloqueia o segundo carregamento na mesma sessão.
+- No GitHub Actions, o navegador sai pelo Cloudflare WARP em modo proxy (`BROWSER_PROXY`),
+  porque a Cloudflare da Workana bloqueia os IPs de datacenter dos runners. Se o WARP não
+  conectar, o bot roda sem proxy. Quando a listagem dá timeout, o print e o HTML da página
+  ficam no artefato `debug-page` da execução.
 - Mantém `seen.json` com os IDs de projetos já processados, para não notificar duas vezes, e
   `pending.json` com as vagas que ainda esperam proposta. O `rejected.json` guarda as vagas que a
   triagem rejeitou.

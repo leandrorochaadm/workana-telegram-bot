@@ -1009,3 +1009,31 @@ def test_main_saves_seen_after_each_alert(workdir, monkeypatch) -> None:
     assert saved[1] == {"a"}
     # "b" never got its alert out but is still queued, even if it leaves the listing
     assert "b" in bot.load_pending()
+
+
+@pytest.mark.parametrize(
+    ("proxy", "expected"),
+    [("socks5://127.0.0.1:40000", {"server": "socks5://127.0.0.1:40000"}), (None, None)],
+)
+def test_open_browser_routes_through_browser_proxy(monkeypatch, proxy, expected):
+    launches: list[dict] = []
+
+    class FakeChromium:
+        def launch(self, **kwargs):
+            launches.append(kwargs)
+            return SimpleNamespace(close=lambda: None)
+
+    @contextmanager
+    def fake_sync_playwright():
+        yield SimpleNamespace(chromium=FakeChromium())
+
+    monkeypatch.setattr(bot, "sync_playwright", fake_sync_playwright)
+    if proxy:
+        monkeypatch.setenv("BROWSER_PROXY", proxy)
+    else:
+        monkeypatch.delenv("BROWSER_PROXY", raising=False)
+
+    with bot.open_browser():
+        pass
+
+    assert launches == [{"headless": True, "proxy": expected}]

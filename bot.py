@@ -79,12 +79,13 @@ telas, responda que dá match. Em reason, explique em uma frase curta, em portug
 vaga pede."""
 # Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
 MAX_PROPOSALS_PER_RUN = 5
-# Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, the
-# deadline below, then one last job (page + Haiku triage + one Opus call) and the commit.
+# Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
+# connecting WARP, the deadline below, then one last job (page + Haiku triage + one
+# Opus call) and the commit.
 # Revisions only start before the deadline, so they never add a call past it.
 PROPOSAL_TIMEOUT_SECONDS = 180
 PAGE_TIMEOUT_MS = 30_000
-PROPOSAL_DEADLINE_SECONDS = 7 * 60
+PROPOSAL_DEADLINE_SECONDS = 5 * 60
 # A job that keeps failing (refusal, page gone) is sent without a proposal after
 # this many tries, so it cannot bill every run forever
 MAX_PROPOSAL_ATTEMPTS = 3
@@ -254,8 +255,10 @@ def save_rejected(rejected: dict[str, dict]) -> None:
 
 @contextmanager
 def open_browser() -> Iterator[Browser]:
+    # Set by the workflow to WARP's local SOCKS proxy: Cloudflare blocks the runners' datacenter IPs
+    proxy = os.environ.get("BROWSER_PROXY")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
         try:
             yield browser
         finally:

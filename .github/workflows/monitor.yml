@@ -40,6 +40,30 @@ jobs:
           version=$(grep -oP '"playwright==\K[0-9.]+' bot.py)
           uv run --with "playwright==$version" playwright install --with-deps chromium
 
+      - name: Connect Cloudflare WARP
+        # Workana's Cloudflare blocks GitHub's datacenter IPs; WARP's proxy mode routes only
+        # the browser through a consumer IP. If it fails the bot still runs without a proxy.
+        # bot.py's PROPOSAL_DEADLINE_SECONDS leaves room for this timeout
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          until warp-cli --accept-tos status >/dev/null 2>&1; do sleep 1; done
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000
+          warp-cli --accept-tos connect
+          until warp-cli --accept-tos status | grep -q Connected; do sleep 1; done
+          trace=$(curl -fsS --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace)
+          grep -E '^(ip|warp)=' <<<"$trace"
+          grep -qx 'warp=on' <<<"$trace"
+          echo "BROWSER_PROXY=socks5://127.0.0.1:40000" >> "$GITHUB_ENV"
+
       - name: Install Claude Code
         # Pinned: the bot relies on this version's flags and JSON output
         run: npm install -g @anthropic-ai/claude-code@2.1.282
