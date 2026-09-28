@@ -38,7 +38,7 @@ ENV_FILE = BASE_DIR / ".env"
 SEEN_FILE = BASE_DIR / "seen.json"
 # Matched jobs still waiting for a proposal: {id: {"title", "url", "attempts"}}
 PENDING_FILE = BASE_DIR / "pending.json"
-# Jobs the triage turned down, kept to tune FIT_PROMPT: {id: {"title", "url", "reason", "date"}}
+# Jobs the triage turned down, kept to tune FIT_PROMPT: {id: {"title", "url", "date"}}
 REJECTED_FILE = BASE_DIR / "rejected.json"
 # Encrypted because the repo is public and the prompt holds private pricing rules
 PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
@@ -74,9 +74,8 @@ Ele não aceita: landing page, site institucional, blog, loja montada em platafo
 integração ou scraping sem telas, planilha, tráfego pago, marketing, conteúdo, vídeo, suporte
 de TI, vaga de emprego fixo ou revenda de app pronto.
 
-Leia a vaga e diga se ela dá match. Na dúvida, quando a vaga pode ser um app ou sistema com
-telas, responda que dá match. Em reason, explique em uma frase curta, em português, o que a
-vaga pede."""
+Leia a vaga e responda só sim ou não: ela dá match? Na dúvida, quando a vaga pode ser um app
+ou sistema com telas, responda sim."""
 # Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
@@ -99,10 +98,9 @@ class ProposalError(Exception):
 
 
 class JobFit(BaseModel):
-    """The Haiku triage answer: whether the job is worth a proposal, and why."""
+    """The Haiku triage answer: whether the job is worth a proposal."""
 
     is_match: bool
-    reason: str
 
 
 class ProposalDraft(BaseModel):
@@ -617,7 +615,7 @@ def format_notification(
     project: dict[str, str],
     proposal: Proposal | None,
     error: str | None,
-    rejection: str | None = None,
+    off_profile: bool = False,
 ) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
     if proposal:
@@ -632,8 +630,8 @@ def format_notification(
             text += "\n\n🔎 <b>Varredura:</b>" + "".join(
                 f"\n• {html.escape(item)}" for item in proposal.review
             )
-    elif rejection:
-        text += f"\n\n🚫 Fora do seu perfil, sem proposta: {html.escape(rejection)}"
+    elif off_profile:
+        text += "\n\n🚫 Fora do seu perfil, sem proposta."
     elif error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
@@ -741,7 +739,8 @@ def main() -> None:
     sent = failed = deferred = turned_down = 0
     try:
         for project in candidates:
-            proposal = error = rejection = None
+            proposal = error = None
+            off_profile = False
             if system:
                 if proposals_left <= 0 or time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
                     # Out of budget: stays pending instead of alerting without a proposal
@@ -749,8 +748,8 @@ def main() -> None:
                     continue
                 try:
                     description = fetch_description(project["url"])
-                    rejection = triage(oauth_token, project, description)
-                    if rejection is None:
+                    off_profile = not triage(oauth_token, project, description)
+                    if not off_profile:
                         proposals_left -= 1
                         proposal = generate_proposal(
                             oauth_token,
@@ -773,12 +772,11 @@ def main() -> None:
                         deferred += 1
                         continue
                     error = "erro ao ler a vaga ou falar com o Claude"
-            if rejection is not None:
+            if off_profile:
                 # Saved before the alert, so a failed send cannot queue the job for another try
                 rejected[project["id"]] = {
                     "title": project["title"],
                     "url": project["url"],
-                    "reason": rejection,
                     "date": datetime.now(UTC).date().isoformat(),
                 }
                 seen.add(project["id"])
@@ -787,7 +785,7 @@ def main() -> None:
                 turned_down += 1
             try:
                 send_telegram(
-                    token, chat_id, format_notification(project, proposal, error, rejection)
+                    token, chat_id, format_notification(project, proposal, error, off_profile)
                 )
                 if proposal:
                     # Plain text, alone in its message, so a long-press copies it whole
@@ -796,13 +794,13 @@ def main() -> None:
             except requests.RequestException as exc:
                 failed += 1
                 print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
-                if rejection is None:
+                if not off_profile:
                     # Stays pending: the next run re-sends it, proposal included, rather
                     # than leaving an alert whose proposal never arrived
                     pending[project["id"]] = _pending_entry(project)
                     save_state()
                 continue
-            if rejection is not None:
+            if off_profile:
                 continue
             seen.add(project["id"])
             pending.pop(project["id"], None)
@@ -820,22 +818,18 @@ def main() -> None:
         sys.exit(1)
 
 
-def triage(oauth_token: str, project: dict[str, str], description: str) -> str | None:
-    """The reason the job was rejected, or None when it deserves a proposal.
+def triage(oauth_token: str, project: dict[str, str], description: str) -> bool:
+    """Whether the job deserves a proposal.
 
     Fails open: a triage error must not cost a job that could fit.
     """
     try:
-        fit = check_fit(oauth_token, project, description)
+        return check_fit(oauth_token, project, description).is_match
     except Exception as exc:  # noqa: BLE001
         # Same rule as the proposal: only ProposalError is safe for the public logs
         detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
         print(f"Triagem falhou em {project['url']}, gerando proposta: {detail}", file=sys.stderr)
-        return None
-    if fit.is_match:
-        return None
-    # An empty reason would read as a plain alert, hiding that the job was rejected
-    return fit.reason.strip() or "sem motivo informado"
+        return True
 
 
 def _pending_entry(project: dict) -> dict:

@@ -228,10 +228,10 @@ def with_proposals(workdir, monkeypatch):
 
     def fake_check_fit(_token, project, _description):
         if "logo" in project["title"]:
-            return bot.JobFit(is_match=False, reason="Pede só a criação de um logo.")
+            return bot.JobFit(is_match=False)
         if "triagem" in project["title"]:
             raise ValueError("saída do modelo com texto sigiloso")
-        return bot.JobFit(is_match=True, reason="App mobile.")
+        return bot.JobFit(is_match=True)
 
     monkeypatch.setattr(bot, "fetch_description", lambda url: f"descrição de {url}")
     monkeypatch.setattr(bot, "check_fit", fake_check_fit)
@@ -310,12 +310,12 @@ def test_main_sends_rejected_job_without_proposal(with_proposals, sent, monkeypa
 
     assert with_proposals == []
     assert len(sent) == 1
-    assert "Fora do seu perfil" in sent[0] and "Pede só a criação de um logo." in sent[0]
+    assert "Fora do seu perfil" in sent[0] and "Preço" not in sent[0]
     assert bot.load_seen() == {"x"}
     assert bot.load_pending() == {}
     [(pid, job)] = bot.load_rejected().items()
     assert pid == "x"
-    assert job["reason"] == "Pede só a criação de um logo."
+    assert "reason" not in job
     assert job["url"] == "https://www.workana.com/job/x" and job["date"]
 
 
@@ -344,14 +344,6 @@ def test_main_rejected_job_keeps_proposal_budget(with_proposals, sent, monkeypat
 
     assert len(with_proposals) == 1
     assert bot.load_seen() == {"a", "b"}
-
-
-def test_triage_names_rejection_without_reason(monkeypatch) -> None:
-    monkeypatch.setattr(
-        bot, "check_fit", lambda *_args: bot.JobFit(is_match=False, reason="  ")
-    )
-
-    assert bot.triage("tok", _project("x", "Site"), "descrição") == "sem motivo informado"
 
 
 def test_main_generates_proposal_when_triage_fails(
@@ -529,12 +521,12 @@ def test_generate_proposal_sends_prompt_and_job(monkeypatch, rates) -> None:
 
 def test_check_fit_asks_haiku_with_job(monkeypatch) -> None:
     calls = _fake_claude(
-        monkeypatch, output={"structured_output": {"is_match": False, "reason": "Landing page."}}
+        monkeypatch, output={"structured_output": {"is_match": False}}
     )
 
     fit = bot.check_fit("tok", _project("x", "Site novo"), "descrição")
 
-    assert fit == bot.JobFit(is_match=False, reason="Landing page.")
+    assert fit == bot.JobFit(is_match=False)
     cmd = calls[0]["cmd"]
     assert cmd[cmd.index("--model") + 1] == bot.FIT_MODEL
     assert "--effort" not in cmd
