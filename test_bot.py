@@ -489,11 +489,26 @@ def rates(monkeypatch):
     monkeypatch.setattr(preco, "MINIMO_PROJETO", 3_000.0)
 
 
-DRAFT_TEXT = "Fecho em {{PRECO}}, em {{PRAZO}}. {{COBRANCA}} {{REGUA}}"
+STEPS_TEXT = (
+    "Primeiro, {{HORAS_PAPEL}} horas no papel. Depois, {{HORAS_DESENHO}} horas de desenho. "
+    "A construção leva {{HORAS_CONSTRUCAO}} horas. Por trás ficam {{HORAS_BASTIDORES}} horas. "
+    "Depois vêm os testes, {{HORAS_TESTES}} horas. E no fim, {{HORAS_LOJA}} horas na loja. "
+    "Somando, são {{HORAS_TOTAL}} horas de trabalho."
+)
+PRICE_TEXT = "O valor é {{PRECO}}, em {{PRAZO}}. {{COBRANCA}} {{REGUA}}"
+DRAFT_TEXT = f"{STEPS_TEXT}\n\n{PRICE_TEXT}"
 
 
 def _draft(**overrides) -> bot.ProposalDraft:
-    fields = {"proposal": DRAFT_TEXT, "dev_hours": 50, "screens": 4, "notes": ""}
+    fields = {
+        "proposal": DRAFT_TEXT,
+        "dev_hours": 50,
+        "build_hours": 20,
+        "backend_hours": 15,
+        "store_hours": 5,
+        "screens": 4,
+        "notes": "",
+    }
     return bot.ProposalDraft(**{**fields, **overrides})
 
 
@@ -557,12 +572,12 @@ def test_generate_proposal_asks_claude_to_fix_scan_errors(monkeypatch, rates) ->
 
 
 def test_generate_proposal_revises_wrong_markers(monkeypatch, rates) -> None:
-    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal="Fecho em {{PRECO}}."), _answer()])
+    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal="O valor é {{PRECO}}."), _answer()])
 
     result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
     assert len(calls) == 2
-    assert "marcadores de preço errados" in calls[1]["input"]
+    assert "marcadores errados" in calls[1]["input"]
     assert "{{" not in result.proposal
 
 
@@ -645,9 +660,9 @@ def test_generate_proposal_raises_when_first_draft_unusable_and_revision_fails(
 
 
 def test_generate_proposal_raises_when_markers_stay_wrong(monkeypatch, rates) -> None:
-    _fake_claude(monkeypatch, output=_answer(proposal="Fecho em {{PRECO}}."))
+    _fake_claude(monkeypatch, output=_answer(proposal="O valor é {{PRECO}}."))
 
-    with pytest.raises(bot.ProposalError, match="marcadores de preço errados"):
+    with pytest.raises(bot.ProposalError, match="marcadores errados"):
         bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
 
@@ -683,17 +698,32 @@ def test_price_proposal_fills_placeholders_from_preco(rates) -> None:
     r = preco.calcula(horas_dev=50, telas=4)
     assert "{{" not in result.proposal
     assert result.proposal == (
-        f"Fecho em R$ 3 200, em dois dias para fechar o projeto no papel e duas semanas de "
+        "Primeiro, 10 horas no papel. Depois, 4 horas de desenho. A construção leva 20 horas. "
+        "Por trás ficam 15 horas. Depois vêm os testes, 10 horas. E no fim, 5 horas na loja. "
+        "Somando, são 64 horas de trabalho.\n\n"
+        f"O valor é R$ 3 200, em dois dias para fechar o projeto no papel e duas semanas de "
         f"desenvolvimento. {preco.frase_da_cobranca(r)} {preco.frase_da_regua(r)}"
     )
     assert result.price == f"R$ 3 200: entrada de {preco.brl0(r.parcelas[0].valor)} e mais 2 de {preco.brl0(r.parcelas[1].valor)}"
     assert result.deadline == preco.prazo_texto(r.fases, r.dias_fase_1)
     assert result.negotiation_floor == "R$ 3 200"
-    assert result.notes == "design assumido. 50 h de dev, 4 telas"
+    assert result.notes == "design assumido. 64 h no total, 50 de dev, 4 telas"
+
+
+def test_price_proposal_drops_steps_without_hours(rates) -> None:
+    text = DRAFT_TEXT.replace(" Por trás ficam {{HORAS_BASTIDORES}} horas.", "").replace(
+        " E no fim, {{HORAS_LOJA}} horas na loja.", ""
+    )
+
+    result = bot.price_proposal(_draft(proposal=text, backend_hours=0, store_hours=0))
+
+    assert "Depois vêm os testes, 30 horas." in result.proposal
+    assert "Somando, são 64 horas de trabalho." in result.proposal
+    assert not any("horas" in item for item in result.review if item.startswith("ERRO"))
 
 
 def test_price_proposal_flags_price_below_minimum(rates) -> None:
-    result = bot.price_proposal(_draft(dev_hours=10))
+    result = bot.price_proposal(_draft(dev_hours=10, build_hours=4, backend_hours=3, store_hours=2))
 
     assert "abaixo do mínimo de R$ 3 000" in result.notes
 
@@ -705,7 +735,9 @@ def test_price_proposal_flags_long_project(rates) -> None:
 
 
 def test_price_proposal_spells_single_remaining_installment(rates) -> None:
-    result = bot.price_proposal(_draft(dev_hours=5, screens=1))
+    result = bot.price_proposal(
+        _draft(dev_hours=5, build_hours=2, backend_hours=1, store_hours=1, screens=1)
+    )
 
     assert "e mais uma de R$" in result.proposal
 
@@ -720,9 +752,14 @@ def test_price_proposal_without_estimate_leaves_price_open(rates) -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"proposal": "Fecho em {{PRECO}}."},
+        {"proposal": "O valor é {{PRECO}}."},
         {"proposal": DRAFT_TEXT + " {{EXTRA}}"},
         {"proposal": DRAFT_TEXT + " {{PRECO}}"},
+        {"proposal": PRICE_TEXT},
+        {"backend_hours": 0},
+        {"build_hours": 0},
+        {"store_hours": -1},
+        {"build_hours": 30},
         {"dev_hours": 0},
         {"screens": 0},
     ],
@@ -739,8 +776,7 @@ def test_review_proposal_lists_errors_before_alerts() -> None:
     assert any("travessão" in item for item in review)
     # A link is only an alert in varredura.py, but it suspends the Workana account
     assert any(item.startswith("ERRO: endereço no texto") for item in review)
-    assert any(item.startswith("alerta: abaixo de 600 palavras") for item in review)
-    assert not any("compromisso antes das perguntas" in item for item in review)
+    assert any(item.startswith("alerta: abaixo de 700 palavras") for item in review)
 
 
 @pytest.mark.parametrize(
@@ -799,7 +835,8 @@ def test_forbidden_wording_prompt_lists_terms_and_rules() -> None:
 def test_review_proposal_keeps_skill_example_clean() -> None:
     # Prices, ratings and download counts are not phone numbers or sites
     text = (
-        "Pelo que está escrito, fecho em R$ 12 000. O app tem nota 4,8 e passou de um milhão "
+        "Primeiro, 11 horas no papel. Somando, são 11 horas de trabalho. "
+        "Pelo que está escrito, o valor é R$ 12 000. O app tem nota 4,8 e passou de um milhão "
         "de downloads. Entrada de R$ 2 400 e mais quatro de R$ 2 400, uma por entrega."
     )
     assert not any(item.startswith("ERRO") for item in bot.review_proposal(text))

@@ -84,14 +84,19 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
 - Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`
   ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
 
-O Claude não faz a conta do preço. Ele estima as horas de desenvolvimento e o número de telas, e
-escreve a proposta com os marcadores `{{PRECO}}`, `{{PRAZO}}`, `{{COBRANCA}}` e `{{REGUA}}`. O
-bot calcula preço, prazo, parcelas e piso com o `preco.py` (copiado da skill `proposta-freela`)
-e troca os marcadores pelos valores. Proposta com marcador faltando ou sobrando é tratada como
-falha e tentada de novo.
+O Claude não faz a conta do preço. Ele estima as horas de desenvolvimento e o número de telas,
+reparte parte das horas entre as etapas (construção, bastidores e loja) e escreve a proposta com
+os marcadores `{{PRECO}}`, `{{PRAZO}}`, `{{COBRANCA}}` e `{{REGUA}}`, mais um marcador de horas
+por etapa (`{{HORAS_PAPEL}}`, `{{HORAS_DESENHO}}`, `{{HORAS_CONSTRUCAO}}`, `{{HORAS_BASTIDORES}}`,
+`{{HORAS_TESTES}}`, `{{HORAS_LOJA}}`) e o `{{HORAS_TOTAL}}`. O bot calcula preço, prazo, parcelas,
+piso e as horas do papel e do desenho com o `preco.py` (copiado da skill `proposta-freela`); os
+testes ficam com o que sobra das horas de desenvolvimento, então as etapas sempre somam o total.
+Etapa com zero horas sai do texto junto com o marcador. Proposta com marcador faltando ou sobrando
+é tratada como falha e tentada de novo.
 
 Com o texto pronto, o bot roda as checagens de texto do `varredura.py` (também copiado da skill):
-travessão, emoji, conectores, palavras proibidas, número de tela ou hora, tamanho etc. O que ele
+travessão, emoji, conectores, palavras proibidas, número de tela, horas que não fecham com o
+total, parágrafo quebrado, tamanho etc. O que ele
 achar como erro (ou marcador faltando) volta para o Claude na mesma execução, junto com a
 proposta anterior e o trecho de cada problema, para ele reescrever. São no máximo
 `MAX_REVISIONS` (2) revisões por proposta, e só antes do prazo da execução, então cada proposta

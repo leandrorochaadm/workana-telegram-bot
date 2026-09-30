@@ -35,13 +35,13 @@ from dataclasses import dataclass
 # Limites que vencem — espelham SKILL.md e references/tom-e-exemplos.md
 # --------------------------------------------------------------------------
 
-PALAVRAS_MIN = 600
-PALAVRAS_MAX = 700
+PALAVRAS_MIN = 700
+PALAVRAS_MAX = 1000
 
 # Frases que prometem exclusividade. Decisão do usuário, ago/2026: não se
 # promete e nem se cita. Frase de agenda ("período integral") não é exclusividade
-# e não cai aqui — mas a disponibilidade em horas saiu do texto por outro motivo,
-# a unidade de divisão, e quem pega isso é checa_unidade_de_divisao.
+# e não cai aqui. A disponibilidade semanal em horas continua fora do texto, e se
+# escapar a checa_soma_das_horas a acusa: ela entra na soma e a conta não fecha.
 EXCLUSIVIDADE = [
     r"s[óo] no seu projeto",
     r"s[óo] ao seu projeto",
@@ -59,6 +59,9 @@ CONECTORES_PROIBIDOS = [
     r"\bdessa forma\b",
     r"\bdesta forma\b",
     r"\bem suma\b",
+    r"\bpor fim\b",
+    r"\bademais\b",
+    r"\bsendo assim\b",
     r"\bvale ressaltar\b",
     r"\bé importante (notar|destacar|ressaltar)\b",
     r"\bn[ãa]o apenas\b.{0,40}\bmas tamb[ée]m\b",
@@ -190,7 +193,7 @@ def checa_exclusividade(texto: str) -> list[Achado]:
             ERRO,
             "exclusividade",
             "A proposta promete exclusividade. Decisão de ago/2026: não se promete e nem se cita. "
-            "Corte a frase; a resposta em até duas horas no bloco sobre mim continua valendo.",
+            "Corte a frase; a resposta em até duas horas, no movimento 9, continua valendo.",
             " / ".join(dict.fromkeys(trechos)),
         )
     ]
@@ -215,7 +218,7 @@ def checa_cobranca_sem_entrada(texto: str) -> list[Achado]:
                     "cobrança sem a entrada",
                     "A frase do pagamento não nomeia a entrada da assinatura, então fica falsa na 1ª parcela "
                     "(o SKILL.md manda: nenhuma linha de código antes dessa parcela). Use a frase literal do "
-                    "fim do movimento 4 em references/tom-e-exemplos.md.",
+                    "fim do movimento 5 em references/tom-e-exemplos.md.",
                     contexto(p, alvo),
                 )
             )
@@ -247,7 +250,7 @@ def checa_cadencia_sem_ancora(texto: str) -> list[Achado]:
 # Titularidade e acesso são coisas diferentes, e a confusão entre as duas gerou a
 # regra errada até 19/08/2026. **A titularidade é do cliente desde o começo** — o
 # código, as contas de loja e o app publicado nascem no nome dele — e isso é fato
-# do contrato, é o argumento mais forte do movimento 5 e **pode ser dito**. O que
+# do contrato, é o argumento mais forte do movimento 6 e **pode ser dito**. O que
 # só acontece no fim é a **entrega dos acessos**: senhas, chaves e credenciais
 # passam para a mão dele quando a entrega termina ou o contrato é encerrado, e
 # isso existe para não haver brecha de segurança no meio do desenvolvimento.
@@ -366,17 +369,18 @@ def checa_tamanho(texto: str) -> list[Achado]:
         return [
             Achado(
                 ALERTA,
-                "abaixo de 600 palavras",
-                f"{n} palavras. Abaixo da faixa alguma coisa foi cortada, quase sempre o bloco sobre mim "
-                "ou o movimento 4. Exceção: vaga vaga demais para orçar.",
+                f"abaixo de {PALAVRAS_MIN} palavras",
+                f"{n} palavras. Abaixo da faixa alguma coisa foi cortada, quase sempre uma etapa do trabalho "
+                "ou o bloco de quem vai fazer. Exceção: vaga vaga demais para orçar.",
             )
         ]
     if n > PALAVRAS_MAX:
         return [
             Achado(
                 ALERTA,
-                "acima de 700 palavras",
-                f"{n} palavras. Acima da faixa o material verdadeiro acabou e o texto virou narrativa.",
+                f"acima de {PALAVRAS_MAX} palavras",
+                f"{n} palavras. Acima da faixa as etapas viraram aula. Encurte o porquê de cada etapa, "
+                "nunca a lista delas.",
             )
         ]
     return []
@@ -391,7 +395,7 @@ def checa_compromisso_precoce(texto: str) -> list[Achado]:
                 ALERTA,
                 "compromisso antes das perguntas",
                 "O número vem com verbo de compromisso fechado, e as três perguntas ainda podem mudar o "
-                "escopo. Ancore em 'pelo escopo que está escrito na vaga'.",
+                "escopo. Ancore em 'Pelo que está escrito, o valor é R$ X'.",
                 contexto(texto, pad),
             )
         ]
@@ -399,23 +403,158 @@ def checa_compromisso_precoce(texto: str) -> list[Achado]:
 
 
 def checa_unidade_de_divisao(texto: str) -> list[Achado]:
-    """Número de tela, hora ou funcionalidade dá ao cliente uma unidade para dividir o preço."""
-    pad = r"\b(\d+|uma|duas|tr[êe]s|quatro|cinco|seis|sete|oito|nove|dez)\s+(telas?|horas?|funcionalidades?)\b"
-    # "respondo em até duas horas" é promessa de atendimento, não unidade de
-    # divisão: o cliente não divide o preço por ela.
-    isento = r"respond|resposta|hor[áa]rio comercial|prazo de retorno"
+    """Número de tela ou de funcionalidade dá ao cliente uma unidade para dividir o preço.
+
+    Hora saiu desta trava em 29/09/2026, por decisão do usuário: as horas por etapa
+    passaram a ir ao texto de propósito, para o cliente ver o tamanho do trabalho.
+    Quem confere as horas agora é `checa_soma_das_horas`.
+    """
+    pad = r"\b(\d+|uma|duas|tr[êe]s|quatro|cinco|seis|sete|oito|nove|dez)\s+(telas?|funcionalidades?)\b"
     out = []
     for frase in re.split(r"(?<=[.!?])\s+", texto):
-        m = re.search(pad, frase, re.IGNORECASE)
-        if not m or re.search(isento, frase, re.IGNORECASE):
+        if not re.search(pad, frase, re.IGNORECASE):
             continue
         out.append(
             Achado(
                 ERRO,
                 "unidade de divisão",
-                "O texto dá ao cliente um número de tela, hora ou funcionalidade para dividir pelo preço. "
-                "Esses números vivem na estimativa e no Anexo I, nunca na proposta.",
+                "O texto dá ao cliente um número de tela ou de funcionalidade para dividir pelo preço. "
+                "Esses números vivem na estimativa e no Anexo I; na proposta, só as horas por etapa.",
                 contexto(frase, pad),
+            )
+        )
+    return out
+
+
+# Hora de esforço: "11 horas", "11 h", "11h", "1,5 hora".
+HORAS = r"\b(\d+(?:[.,]\d+)?)\s*(?:horas?\b|h\b)"
+# "Respondo em até duas horas" é promessa de atendimento, não etapa do trabalho:
+# fica isento o número precedido de "até".
+HORAS_ISENTAS_ANTES = r"\bat[ée]\s*$"
+# A frase que fecha a lista de etapas com a soma começa por uma destas.
+HORAS_TOTAL = r"^\s*(somando|no total|ao todo)\b"
+
+
+def _num(txt: str) -> float:
+    return float(txt.replace(",", "."))
+
+
+def horas_citadas(texto: str) -> tuple[list[float], float | None]:
+    """As horas de cada etapa e o total declarado, na ordem em que aparecem."""
+    etapas: list[float] = []
+    total: float | None = None
+    for frase in re.split(r"(?<=[.!?])\s+", texto):
+        e_total = re.search(HORAS_TOTAL, frase, re.IGNORECASE)
+        for m in re.finditer(HORAS, frase, re.IGNORECASE):
+            if re.search(HORAS_ISENTAS_ANTES, frase[: m.start()], re.IGNORECASE):
+                continue
+            if e_total:
+                total = _num(m.group(1))
+            else:
+                etapas.append(_num(m.group(1)))
+    return etapas, total
+
+
+def _fmt(n: float) -> str:
+    return f"{n:g}".replace(".", ",")
+
+
+def checa_soma_das_horas(texto: str) -> list[Achado]:
+    """As horas por etapa têm de existir, quando há preço, e fechar com o total declarado."""
+    etapas, total = horas_citadas(texto)
+    if not etapas and total is None:
+        if valores_citados(texto):
+            return [
+                Achado(
+                    ERRO,
+                    "faltam as horas por etapa",
+                    "O texto dá o preço sem mostrar as horas de cada etapa. Desde 29/09/2026 as seis etapas "
+                    "com as horas vêm antes do número (movimento 4). Exceção: vaga vaga demais, sem preço.",
+                )
+            ]
+        return []
+    if total is None:
+        return [
+            Achado(
+                ERRO,
+                "horas sem total",
+                "O texto cita horas por etapa e não fecha com a soma. A frase do total começa com 'Somando', "
+                "'No total' ou 'Ao todo' ('Somando, são N horas de trabalho').",
+            )
+        ]
+    if abs(sum(etapas) - total) > 1e-9:
+        return [
+            Achado(
+                ERRO,
+                "horas que não fecham",
+                f"As horas citadas fora da frase do total somam {_fmt(sum(etapas))} h e o total declarado é "
+                f"{_fmt(total)} h. Ou uma etapa está errada, ou há outro número de horas no texto (a "
+                "disponibilidade semanal, o prazo da loja) que não deveria estar lá.",
+            )
+        ]
+    return []
+
+
+def checa_horas_batem(proposta: str, analise: str) -> list[Achado]:
+    """O total de horas do texto é o Total da seção 'A conta do preço', sem redigitação."""
+    _, total = horas_citadas(proposta)
+    if total is None:
+        return []
+    secao = re.search(r"^## A conta do pre[çc]o\s*$(.*?)(?=^## |\Z)", analise, re.MULTILINE | re.DOTALL)
+    m = secao and re.search(r"\|\s*\*\*Total\*\*\s*\|\s*\*\*(\d+(?:[.,]\d+)?)\s*h\*\*", secao.group(1))
+    if not m:
+        return [
+            Achado(
+                ALERTA,
+                "total de horas sem lastro",
+                "Não achei a linha **Total** da seção 'A conta do preço' no analise.md para conferir as horas "
+                "do texto.",
+            )
+        ]
+    if abs(_num(m.group(1)) - total) > 1e-9:
+        return [
+            Achado(
+                ERRO,
+                "total de horas diferente do script",
+                f"O texto diz {_fmt(total)} h e a conta do preço diz {m.group(1)} h. O preço sai dessas horas, e "
+                "o cliente que dividir um pelo outro tem de chegar no mesmo número.",
+            )
+        ]
+    return []
+
+
+def checa_quebra_de_linha(texto_bruto: str) -> list[Achado]:
+    """Parágrafo em linha única; só a lista numerada das perguntas tem uma linha por item.
+
+    Decisão do usuário, 29/09/2026: texto corrido, sem quebra de linha no meio do
+    parágrafo. Linha em branco entre parágrafos pode. Roda no texto antes de desdobrar.
+    """
+    out = []
+    for p in paragrafos(texto_bruto):
+        linhas = p.split("\n")
+        for l in linhas:
+            if re.match(r"\s*(#+\s|[-*•]\s)", l):
+                out.append(
+                    Achado(
+                        ERRO,
+                        "título ou marcador",
+                        "A proposta é texto corrido: sem título e sem marcador. A única lista é a numeração "
+                        "das três perguntas ('1. ').",
+                        _corta(l),
+                    )
+                )
+        if len(linhas) == 1:
+            continue
+        if all(re.match(r"\s*\d+\.\s", l) for l in linhas) or re.match(r"\s*(#+\s|[-*•]\s)", linhas[0]):
+            continue
+        out.append(
+            Achado(
+                ERRO,
+                "quebra de linha no parágrafo",
+                "O parágrafo está quebrado em várias linhas. Cada parágrafo vai numa linha só, e cada "
+                "pergunta numerada também ('1. ', não '1)'). A frase que abre a lista precisa de uma linha "
+                "em branco antes do '1.'.",
+                _corta(linhas[0]),
             )
         )
     return out
@@ -765,12 +904,14 @@ def varre(proposta: str, analise: str | None) -> list[Achado]:
     achados: list[Achado] = []
     # As travas são expressões de várias palavras, e o arquivo vem quebrado em 80
     # colunas: sem desdobrar, a quebra de linha no meio da âncora salva o texto.
+    achados += checa_quebra_de_linha(proposta)
     proposta = desdobra(proposta)
     achados += checa_exclusividade(proposta)
     achados += checa_cobranca_sem_entrada(proposta)
     achados += checa_cadencia_sem_ancora(proposta)
     achados += checa_acessos(proposta)
     achados += checa_unidade_de_divisao(proposta)
+    achados += checa_soma_das_horas(proposta)
     achados += checa_formatacao(proposta)
     achados += checa_compromisso_precoce(proposta)
     achados += checa_tamanho(proposta)
@@ -782,6 +923,7 @@ def varre(proposta: str, analise: str | None) -> list[Achado]:
         achados += checa_cobertura_da_vaga(analise)
         achados += checa_citacao_reaproveitada(analise)
         achados += checa_valores_batem(proposta, analise)
+        achados += checa_horas_batem(proposta, analise)
     return achados
 
 

@@ -781,7 +781,7 @@ class TestSaida(unittest.TestCase):
             self.assertIn("projeto escrito", frase, f"{dev} h")
 
     def test_a_mecanica_nao_se_repete_na_frase_da_regua(self):
-        # A mecânica é dita uma vez, no movimento 4. Repeti-la no movimento 5 é o
+        # A mecânica é dita uma vez, no movimento 5. Repeti-la no movimento 6 é o
         # defeito mais provável de um texto de 700 palavras.
         for dev in (35, 150, 365):
             frase = preco.frase_da_regua(calcula(horas_dev=dev, telas=9))

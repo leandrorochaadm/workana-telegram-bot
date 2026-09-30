@@ -30,6 +30,9 @@ from varredura import (
     checa_acessos,
     checa_titulos_duplicados,
     checa_unidade_de_divisao,
+    checa_soma_das_horas,
+    checa_horas_batem,
+    checa_quebra_de_linha,
     checa_valores_batem,
     conta_palavras,
     relatorio,
@@ -38,7 +41,7 @@ from varredura import (
     varre,
 )
 
-# O parágrafo do movimento 4 na forma correta, que nenhuma checagem pode acusar.
+# O parágrafo do movimento 5 na forma correta, que nenhuma checagem pode acusar.
 MOVIMENTO_4_BOM = (
     "Sobre como corre: os dois primeiros dias são para fechar o projeto no papel. Depois que você "
     "aprovar eu começo a montar, em fases. Tem uma entrada na assinatura: ela reserva a agenda e "
@@ -274,6 +277,89 @@ class TestUnidadeDeDivisao(unittest.TestCase):
         texto = "Respondo em até duas horas no horário comercial."
         self.assertEqual(checa_unidade_de_divisao(texto), [])
 
+    def test_horas_por_etapa_passaram_a_valer(self):
+        """Decisão de 29/09/2026: as horas por etapa vão ao texto de propósito."""
+        self.assertEqual(checa_unidade_de_divisao("Depois vem o desenho das telas, 6 horas."), [])
+
+
+class TestHoras(unittest.TestCase):
+    ETAPAS = (
+        "Primeiro, 11 horas para fechar o projeto no papel. Depois, 6 horas de desenho. "
+        "A construção leva 50 horas. Somando, são 67 horas de trabalho."
+    )
+
+    def test_soma_que_fecha_passa(self):
+        self.assertEqual(checa_soma_das_horas(self.ETAPAS), [])
+
+    def test_soma_que_nao_fecha_reprova(self):
+        a = checa_soma_das_horas(self.ETAPAS.replace("67 horas", "70 horas"))
+        self.assertEqual(a[0].regra, "horas que não fecham")
+
+    def test_etapas_sem_total_reprova(self):
+        a = checa_soma_das_horas("Primeiro, 11 horas para fechar o projeto no papel.")
+        self.assertEqual(a[0].regra, "horas sem total")
+
+    def test_resposta_em_duas_horas_nao_entra_na_soma(self):
+        texto = self.ETAPAS + " Respondo em até duas horas no horário comercial."
+        self.assertEqual(checa_soma_das_horas(texto), [])
+
+    def test_disponibilidade_semanal_que_escapa_e_acusada(self):
+        texto = self.ETAPAS + " Tenho 30 horas por semana para o seu projeto."
+        self.assertTrue(checa_soma_das_horas(texto))
+
+    def test_texto_sem_horas_nem_preco_passa(self):
+        """A vaga vaga demais: sem preço, sem etapas."""
+        self.assertEqual(checa_soma_das_horas("Me responde essas três e eu te mando o valor."), [])
+
+    def test_total_bate_com_a_conta_do_preco(self):
+        analise = "## A conta do preço\n\n| **Total** | **67 h** |\n"
+        self.assertEqual(checa_horas_batem(self.ETAPAS, analise), [])
+        analise = "## A conta do preço\n\n| **Total** | **137 h** |\n"
+        self.assertEqual(checa_horas_batem(self.ETAPAS, analise)[0].nivel, ERRO)
+
+    def test_total_de_outra_tabela_nao_confunde(self):
+        analise = (
+            "## Estimativa de horas\n\n| **Total** | **60 h** |\n\n"
+            "## A conta do preço\n\n| **Total** | **67 h** |\n"
+        )
+        self.assertEqual(checa_horas_batem(self.ETAPAS, analise), [])
+
+    def test_h_abreviado_conta(self):
+        texto = "Primeiro, 11 h de projeto. Depois, 6h de desenho. Somando, são 17 horas de trabalho."
+        self.assertEqual(checa_soma_das_horas(texto), [])
+
+    def test_palavra_resposta_na_etapa_nao_isenta(self):
+        """Achado da revisão de 29/09/2026: 'resposta' numa frase de etapa sumia com as horas dela."""
+        texto = (
+            "Por trás ficam 35 horas, seja qual for a resposta da pergunta 3. "
+            "O resto são 10 horas. Somando, são 45 horas de trabalho."
+        )
+        self.assertEqual(checa_soma_das_horas(texto), [])
+
+    def test_total_so_pela_frase_que_abre_com_somando(self):
+        texto = "Deixo controle total do app em 20 horas. Depois, 5 horas. Somando, são 25 horas."
+        self.assertEqual(checa_soma_das_horas(texto), [])
+
+    def test_preco_sem_horas_reprova(self):
+        a = checa_soma_das_horas("Pelo que está escrito, o valor é R$ 4 800.")
+        self.assertEqual(a[0].regra, "faltam as horas por etapa")
+
+
+class TestQuebraDeLinha(unittest.TestCase):
+    def test_paragrafo_em_linha_unica_passa(self):
+        self.assertEqual(checa_quebra_de_linha("Oi, tudo bem?\n\nUma frase. Outra frase."), [])
+
+    def test_paragrafo_quebrado_reprova(self):
+        a = checa_quebra_de_linha("Uma frase que\ncontinua na linha de baixo.")
+        self.assertEqual(a[0].nivel, ERRO)
+
+    def test_titulo_e_marcador_reprovam(self):
+        self.assertTrue(checa_quebra_de_linha("# Proposta\n\nTexto."))
+        self.assertTrue(checa_quebra_de_linha("- um item"))
+
+    def test_lista_numerada_passa(self):
+        self.assertEqual(checa_quebra_de_linha("1. Uma pergunta?\n2. Outra?\n3. Mais uma?"), [])
+
 
 class TestCompromissoPrecoce(unittest.TestCase):
     def test_fecho_em_alerta(self):
@@ -289,10 +375,10 @@ class TestTamanho(unittest.TestCase):
         self.assertEqual(checa_tamanho("palavra " * 300)[0].nivel, ALERTA)
 
     def test_longo_demais(self):
-        self.assertEqual(checa_tamanho("palavra " * 800)[0].nivel, ALERTA)
+        self.assertEqual(checa_tamanho("palavra " * 1100)[0].nivel, ALERTA)
 
     def test_na_faixa_passa(self):
-        self.assertEqual(checa_tamanho("palavra " * 650), [])
+        self.assertEqual(checa_tamanho("palavra " * 850), [])
 
 
 class TestAnalise(unittest.TestCase):

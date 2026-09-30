@@ -767,10 +767,10 @@ def extenso(n: int) -> str:
 
 
 def frase_da_cobranca(r: Resultado) -> str:
-    """A frase da cobrança, que vai no movimento 4 da proposta.
+    """A frase da cobrança, que vai no movimento 5 da proposta.
 
-    Separada da régua em 18/08/2026, quando o movimento 4 passou a contar as fases:
-    a **mecânica** do dinheiro é dita uma vez, aqui, e o movimento 5 leva só os
+    Separada da régua em 18/08/2026, quando o movimento 5 passou a contar as fases:
+    a **mecânica** do dinheiro é dita uma vez, aqui, e o movimento 6 leva só os
     **valores**. Repetir a mecânica nos dois é o defeito mais provável de um texto
     de 700 palavras.
 
@@ -787,7 +787,7 @@ def frase_da_cobranca(r: Resultado) -> str:
     **E a frase diz o que a entrada compra, desde 26/08/2026.** O "dali em diante"
     da redação anterior marcava um degrau e deixava a entrada, por eliminação, como a
     parcela paga sem contrapartida. Ver `references/tom-e-exemplos.md`, primeira
-    das três frases literais no fim do movimento 4.
+    das três frases literais no fim do movimento 5.
 
     **Em 01/09/2026 a ordem mudou e a frase mudou junto.** O projeto escrito é
     apresentado antes de qualquer pagamento; é a aprovação dele que abre a
@@ -804,7 +804,7 @@ def frase_da_cobranca(r: Resultado) -> str:
 
 
 def frase_da_regua(r: Resultado) -> str:
-    """A frase da régua que vai no movimento 5 da proposta, pronta para colar.
+    """A frase da régua que vai no movimento 6 da proposta, pronta para colar.
 
     Mora aqui, e não na cabeça de quem escreve, porque desde 18/08/2026 os valores
     das parcelas vão no texto de venda: frase montada à mão é como a proposta passa
@@ -820,7 +820,7 @@ def frase_da_regua(r: Resultado) -> str:
     que é justamente a informação que a frase existe para dar. Correção de
     18/08/2026, vinda de uma proposta gerada sem o valor da entrada.
 
-    Vão só os valores, e a mecânica não se repete aqui: ela é dita no movimento 4,
+    Vão só os valores, e a mecânica não se repete aqui: ela é dita no movimento 5,
     por `frase_da_cobranca`. O evento que destrava cada parcela continua fora do
     texto: é ali que a régua vira tabela e o texto de venda vira contrato.
     """
@@ -916,7 +916,7 @@ def markdown(r: Resultado) -> str:
         "entrega de valer mais do que a parcela dela. **As horas não se remanejam entre fases** "
         "— o que não coube na semana entra na seguinte, e o conteúdo de cada uma é que se ajusta. "
         "Preencha a coluna do que fica pronto no analise.md com o conteúdo real; na proposta, diga "
-        "quanto tempo é cada fase e o que ele recebe em cada uma, sem citar horas."
+        "quanto tempo é cada fase e o que ele recebe em cada uma, sem citar as horas da fase: as horas vão ao texto por etapa do trabalho, e a soma delas é o Total acima."
     )
     add("")
     add(
@@ -968,13 +968,13 @@ def markdown(r: Resultado) -> str:
     add("")
     add(
         "**As duas frases que vão no texto da proposta**, prontas para colar. A "
-        "mecânica do dinheiro é dita uma vez, no movimento 4:"
+        "mecânica do dinheiro é dita uma vez, no movimento 5:"
     )
     add("")
     add(f"> {frase_da_cobranca(r)}")
     add("")
     add(
-        "E os valores vão no movimento 5, sem repetir a mecânica. O que destrava cada "
+        "E os valores vão no movimento 6, sem repetir a mecânica. O que destrava cada "
         "parcela fica para a conversa e para a Cláusula 2ª:"
     )
     add("")

@@ -105,10 +105,14 @@ class JobFit(BaseModel):
 
 
 class ProposalDraft(BaseModel):
-    """What the model returns: the text with price placeholders, plus the estimate."""
+    """What the model returns: the text with price and hour placeholders, plus the estimate."""
 
     proposal: str
     dev_hours: int
+    # Parts of dev_hours shown as steps; the tests step takes the rest, rounding included
+    build_hours: int
+    backend_hours: int
+    store_hours: int
     screens: int
     notes: str
 
@@ -126,9 +130,18 @@ class Proposal(BaseModel):
 # The model estimates hours and writes these markers; preco.py does the arithmetic,
 # since the model gets it wrong and the rates stay out of the prompt
 PRICE_PLACEHOLDERS = ("{{PRECO}}", "{{PRAZO}}", "{{COBRANCA}}", "{{REGUA}}")
+# The six steps of the proposal, in the skill's order, plus their sum. A step with
+# no hours leaves the text, so its marker must be absent
+HOUR_PLACEHOLDERS = (
+    "{{HORAS_PAPEL}}",
+    "{{HORAS_DESENHO}}",
+    "{{HORAS_CONSTRUCAO}}",
+    "{{HORAS_BASTIDORES}}",
+    "{{HORAS_TESTES}}",
+    "{{HORAS_LOJA}}",
+    "{{HORAS_TOTAL}}",
+)
 PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
-# The prompt mandates "Pelo que está escrito, fecho em", as the skill's own examples do
-IGNORED_REVIEW_RULES = {"compromisso antes das perguntas"}
 # Links are only a style alert for direct clients, but they get the Workana account suspended
 WORKANA_BLOCKING_RULES = ("endereço no texto",)
 REVIEW_EXCERPT_CHARS = 60
@@ -154,7 +167,8 @@ FORBIDDEN_WORDING = (
         (
             "além disso", "portanto", "dessa forma", "desta forma", "em suma", "vale ressaltar",
             "é importante notar", "é importante destacar", "é importante ressaltar",
-            "não apenas X, mas também Y", "no mundo de hoje", "solução robusta",
+            "não apenas X, mas também Y", "no mundo de hoje", "solução robusta", "por fim",
+            "ademais", "sendo assim",
         ),
     ),
     (
@@ -185,8 +199,11 @@ FORBIDDEN_RULES = (
     "Sem travessão (—) nem meia risca (–): use vírgula, dois-pontos ou ponto.",
     "Sem emoji, negrito ou itálico (nada de * ou **).",
     "Sem e-mail, telefone, link, domínio (.com, .br, .app...), GitHub ou Behance.",
-    "Sem número de telas, horas ou funcionalidades (ex.: \"8 telas\", \"três funcionalidades\"); "
-    "a única exceção é o prazo de resposta (\"respondo em até duas horas\").",
+    "Sem número de telas ou de funcionalidades (ex.: \"8 telas\", \"três funcionalidades\").",
+    "Horas só as das etapas, pelos marcadores, e o prazo de resposta (\"respondo em até duas "
+    "horas\"); nenhuma outra conta de horas, nem horas por semana.",
+    "Cada parágrafo numa linha só, com uma linha em branco entre eles, sem título nem marcador "
+    "de lista; só as três perguntas vão numeradas (\"1. \"), uma por linha.",
     "A frase do pagamento que diz que algo é cobrado depois da entrega nomeia a entrada no "
     "mesmo parágrafo.",
     "A promessa de versão toda semana ou toda sexta vem ancorada na mesma frase: \"Dentro da "
@@ -384,8 +401,6 @@ def scan_proposal(text: str) -> list[varredura.Achado]:
     """varredura.py's text checks, adjusted for Workana, errors first."""
     findings = workana_findings(varredura.desdobra(text))
     for finding in varredura.varre(text, None):
-        if finding.regra in IGNORED_REVIEW_RULES:
-            continue
         if finding.regra.startswith(WORKANA_BLOCKING_RULES):
             finding.nivel = varredura.ERRO
         findings.append(finding)
@@ -408,7 +423,7 @@ def proposal_problems(draft: ProposalDraft) -> tuple[bool, list[str]]:
     try:
         proposal = price_proposal(draft)
     except ProposalError as exc:
-        return False, [f"{exc}. Siga a regra dos quatro marcadores do sistema."]
+        return False, [f"{exc}. Siga as regras dos marcadores de preço e de horas do sistema."]
     problems = []
     for finding in scan_proposal(proposal.proposal):
         if finding.nivel != varredura.ERRO:
@@ -428,9 +443,9 @@ def revision_request(draft: ProposalDraft, problems: list[str]) -> str:
         "problemas, e cada um precisa sair do texto:\n"
         f"{listed}\n\n"
         "Reescreva só o necessário para eliminar todos eles, mantendo o resto do texto, as regras "
-        "do sistema e os quatro marcadores. Os trechos citados mostram o texto já com os "
-        "marcadores trocados pelos valores. Devolva o resultado completo, com as mesmas horas e "
-        "telas, a não ser que algum problema exija mudar.\n"
+        "do sistema e os marcadores. Os trechos citados mostram o texto já com os marcadores "
+        "trocados pelos valores. Devolva o resultado completo, com as mesmas horas e telas, a não "
+        "ser que algum problema exija mudar.\n"
         f"</revisao>\n\n<proposta_anterior>\n{draft.proposal}\n</proposta_anterior>"
     )
 
@@ -453,24 +468,29 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
         )
     if draft.screens <= 0:
         raise ProposalError(f"estimativa sem telas ({draft.dev_hours} h)")
-    # Each exactly once: a repeated marker would print the price twice
-    if sorted(found) != sorted(PRICE_PLACEHOLDERS):
-        raise ProposalError(f"marcadores de preço errados: {sorted(found)}")
 
     r = preco.calcula(horas_dev=draft.dev_hours, telas=draft.screens)
+    hours = step_hours(draft, r)
+    expected = [*PRICE_PLACEHOLDERS, *(marker for marker, h in hours.items() if h > 0)]
+    # Each exactly once: a repeated marker would print the price twice
+    if sorted(found) != sorted(expected):
+        raise ProposalError(f"marcadores errados: {sorted(found)}, esperados {sorted(expected)}")
+
     text = draft.proposal
     for marker, value in zip(
         PRICE_PLACEHOLDERS,
         (preco.brl0(r.preco), client_deadline(r), preco.frase_da_cobranca(r), preco.frase_da_regua(r)),
     ):
         text = text.replace(marker, value)
+    for marker, h in hours.items():
+        text = text.replace(marker, str(h))
 
     installments = r.parcelas
     price = f"{preco.brl0(r.preco)}: entrada de {preco.brl0(installments[0].valor)}"
     if len(installments) > 1:
         price += f" e mais {len(installments) - 1} de {preco.brl0(installments[1].valor)}"
     notes = [draft.notes.strip().rstrip(".")] if draft.notes.strip() else []
-    notes.append(f"{draft.dev_hours} h de dev, {draft.screens} telas")
+    notes.append(f"{r.horas_total} h no total, {draft.dev_hours} de dev, {draft.screens} telas")
     if r.preco < preco.MINIMO_PROJETO:
         notes.append(f"abaixo do mínimo de {preco.brl0(preco.MINIMO_PROJETO)}")
     if r.fases - 1 > preco.SEMANAS_PROJETO_LONGO:
@@ -482,6 +502,37 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
         negotiation_floor=preco.brl0(r.piso),
         notes=". ".join(notes),
         review=review_proposal(text),
+    )
+
+
+def step_hours(draft: ProposalDraft, r: preco.Resultado) -> dict[str, int]:
+    """Hours of each proposal step, adding up to preco.py's total.
+
+    The first two steps come from preco.py; the tests step takes whatever the other
+    dev steps leave, which is where the skill puts the rounding.
+    """
+    shown = draft.build_hours + draft.backend_hours + draft.store_hours
+    if min(draft.build_hours, draft.backend_hours, draft.store_hours) < 0:
+        raise ProposalError("horas por etapa negativas")
+    tests = r.horas_dev - shown
+    if draft.build_hours <= 0 or tests <= 0:
+        raise ProposalError(
+            f"horas por etapa ({shown} h em construção, bastidores e loja) sem sobra para testes "
+            f"dentro de dev_hours ({r.horas_dev} h)"
+        )
+    return dict(
+        zip(
+            HOUR_PLACEHOLDERS,
+            (
+                r.horas_fase_1,
+                r.horas_desenho,
+                draft.build_hours,
+                draft.backend_hours,
+                tests,
+                draft.store_hours,
+                r.horas_total,
+            ),
+        )
     )
 
 
