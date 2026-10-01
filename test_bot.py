@@ -495,8 +495,14 @@ STEPS_TEXT = (
     "Depois vêm os testes, {{HORAS_TESTES}} horas. E no fim, {{HORAS_LOJA}} horas na loja. "
     "Somando, são {{HORAS_TOTAL}} horas de trabalho."
 )
+# The fixed greeting and the understanding paragraph the scan requires on a priced proposal
+OPENING_TEXT = (
+    f"{varredura.CUMPRIMENTO}\n\n"
+    "Pelo que você escreveu, eu entendi que você quer o pedido no sistema na hora. "
+    "É isso mesmo que você deseja? Se eu entendi algo errado, me corrige que eu ajusto."
+)
 PRICE_TEXT = "O valor é {{PRECO}}, em {{PRAZO}}. {{COBRANCA}} {{REGUA}}"
-DRAFT_TEXT = f"{STEPS_TEXT}\n\n{PRICE_TEXT}"
+DRAFT_TEXT = f"{OPENING_TEXT}\n\n{STEPS_TEXT}\n\n{PRICE_TEXT}"
 
 
 def _draft(**overrides) -> bot.ProposalDraft:
@@ -697,7 +703,7 @@ def test_price_proposal_fills_placeholders_from_preco(rates) -> None:
 
     r = preco.calcula(horas_dev=50, telas=4)
     assert "{{" not in result.proposal
-    assert result.proposal == (
+    assert result.proposal == OPENING_TEXT + "\n\n" + (
         "Primeiro, 10 horas no papel. Depois, 4 horas de desenho. A construção leva 20 horas. "
         "Por trás ficam 15 horas. Depois vêm os testes, 10 horas. E no fim, 5 horas na loja. "
         "Somando, são 64 horas de trabalho.\n\n"
@@ -776,7 +782,7 @@ def test_review_proposal_lists_errors_before_alerts() -> None:
     assert any("travessão" in item for item in review)
     # A link is only an alert in varredura.py, but it suspends the Workana account
     assert any(item.startswith("ERRO: endereço no texto") for item in review)
-    assert any(item.startswith("alerta: abaixo de 700 palavras") for item in review)
+    assert any(item.startswith("alerta: abaixo de 600 palavras") for item in review)
 
 
 @pytest.mark.parametrize(
@@ -833,8 +839,9 @@ def test_forbidden_wording_prompt_lists_terms_and_rules() -> None:
 
 
 def test_review_proposal_keeps_skill_example_clean() -> None:
-    # Prices, ratings and download counts are not phone numbers or sites
-    text = (
+    # Prices, ratings and download counts are not phone numbers or sites, and the fixed
+    # greeting's "é só me chamar" is not an invitation Workana blocks
+    text = OPENING_TEXT + "\n\n" + (
         "Primeiro, 11 horas no papel. Somando, são 11 horas de trabalho. "
         "Pelo que está escrito, o valor é R$ 12 000. O app tem nota 4,8 e passou de um milhão "
         "de downloads. Entrada de R$ 2 400 e mais quatro de R$ 2 400, uma por entrega."

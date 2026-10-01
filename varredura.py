@@ -12,7 +12,7 @@ exclusividade fora das semanas de desenvolvimento com a regra escrita, e cobriu
 com cadência semanal uma fase 1 que não tem build.
 
 Aqui ficam só as regras **decidíveis por texto**. Julgamento — o gancho, o teste
-do aliado, se as três perguntas são boas — continua sendo leitura humana, e é
+do aliado, se o objetivo no entendimento é o dele — continua sendo leitura humana, e é
 justamente para sobrar atenção para elas que o resto virou código.
 
 Uso:
@@ -35,8 +35,8 @@ from dataclasses import dataclass
 # Limites que vencem — espelham SKILL.md e references/tom-e-exemplos.md
 # --------------------------------------------------------------------------
 
-PALAVRAS_MIN = 700
-PALAVRAS_MAX = 1000
+PALAVRAS_MIN = 600
+PALAVRAS_MAX = 800
 
 # Frases que prometem exclusividade. Decisão do usuário, ago/2026: não se
 # promete e nem se cita. Frase de agenda ("período integral") não é exclusividade
@@ -331,7 +331,7 @@ def checa_formatacao(texto: str) -> list[Achado]:
             )
 
     if "**" in texto or re.search(r"(?<!\*)\*(?!\*)\w", texto):
-        out.append(Achado(ERRO, "negrito", "A proposta tem formatação em negrito ou itálico. Só a numeração das três perguntas é permitida."))
+        out.append(Achado(ERRO, "negrito", "A proposta tem formatação em negrito ou itálico. Nenhuma formatação é permitida."))
 
     for pad in CONECTORES_PROIBIDOS:
         if re.search(pad, texto, re.IGNORECASE):
@@ -363,8 +363,41 @@ def checa_formatacao(texto: str) -> list[Achado]:
     return out
 
 
+CUMPRIMENTO = (
+    "Oi! Sei que o seu tempo é precioso e que você deve ter um monte de propostas pra analisar, "
+    "então vou ser breve e direto. Mas se ficar qualquer dúvida, é só me chamar."
+)
+
+
+def _colapsa_espacos(texto: str) -> str:
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def sem_cumprimento(texto: str) -> str:
+    """Tira o cumprimento fixo do topo: ele não come a faixa de palavras das etapas."""
+    blocos = paragrafos(texto)
+    if blocos and _colapsa_espacos(blocos[0]) == CUMPRIMENTO:
+        blocos = blocos[1:]
+    return "\n\n".join(blocos)
+
+
+def checa_cumprimento(texto: str) -> list[Achado]:
+    """Decisão do usuário, 01/10/2026: o cumprimento é literal e abre a proposta sozinho."""
+    blocos = paragrafos(texto)
+    if blocos and _colapsa_espacos(blocos[0]) == CUMPRIMENTO:
+        return []
+    return [
+        Achado(
+            ERRO,
+            "cumprimento fora do padrão",
+            f"O primeiro parágrafo é o cumprimento literal, sozinho: '{CUMPRIMENTO}'",
+            _corta(blocos[0]) if blocos else "",
+        )
+    ]
+
+
 def checa_tamanho(texto: str) -> list[Achado]:
-    n = conta_palavras(texto)
+    n = conta_palavras(sem_cumprimento(texto))
     if n < PALAVRAS_MIN:
         return [
             Achado(
@@ -386,6 +419,52 @@ def checa_tamanho(texto: str) -> list[Achado]:
     return []
 
 
+ENTENDIMENTO_ABRE = "pelo que você escreveu, eu entendi que"
+ENTENDIMENTO_FECHA = "é isso mesmo que você deseja? se eu entendi algo errado, me corrige que eu ajusto."
+
+
+def checa_entendimento(texto: str) -> list[Achado]:
+    """Decisão do usuário, 01/10/2026: o gancho é o entendimento, e é a única pergunta do texto.
+
+    Nenhuma proposta leva lista de perguntas. As frases literais do entendimento só
+    são exigidas na proposta completa (com preço).
+    """
+    out = []
+    lista = re.search(r"(?m)^\s*\d+\.\s", texto)
+    if lista:
+        out.append(
+            Achado(
+                ERRO,
+                "perguntas no fim",
+                "Desde 01/10/2026 a proposta não leva lista de perguntas: elas vão para as perguntas "
+                "de qualificação do analise.md. A única pergunta do texto é a do entendimento.",
+                _corta(texto[lista.start():].split("\n")[0]),
+            )
+        )
+    if not valores_citados(texto):
+        return out
+    baixo = texto.lower()
+    if ENTENDIMENTO_ABRE not in baixo:
+        out.append(
+            Achado(
+                ERRO,
+                "falta o entendimento",
+                "O parágrafo depois do cumprimento abre com 'Pelo que você escreveu, eu entendi que', "
+                "seguido só do objetivo do cliente (movimento 1).",
+            )
+        )
+    if ENTENDIMENTO_FECHA not in baixo:
+        out.append(
+            Achado(
+                ERRO,
+                "falta a pergunta do entendimento",
+                "O entendimento fecha com a frase literal 'É isso mesmo que você deseja? Se eu entendi algo "
+                "errado, me corrige que eu ajusto.'",
+            )
+        )
+    return out
+
+
 def checa_compromisso_precoce(texto: str) -> list[Achado]:
     """'Fecho em R$ X' compromete valor antes das respostas que mudam o escopo."""
     pad = r"\bfecho em\b|\bfica fechado em\b|\bpre[çc]o final\b"
@@ -393,8 +472,8 @@ def checa_compromisso_precoce(texto: str) -> list[Achado]:
         return [
             Achado(
                 ALERTA,
-                "compromisso antes das perguntas",
-                "O número vem com verbo de compromisso fechado, e as três perguntas ainda podem mudar o "
+                "compromisso antes das respostas",
+                "O número vem com verbo de compromisso fechado, e o que o cliente responder ainda pode mudar o "
                 "escopo. Ancore em 'Pelo que está escrito, o valor é R$ X'.",
                 contexto(texto, pad),
             )
@@ -524,7 +603,7 @@ def checa_horas_batem(proposta: str, analise: str) -> list[Achado]:
 
 
 def checa_quebra_de_linha(texto_bruto: str) -> list[Achado]:
-    """Parágrafo em linha única; só a lista numerada das perguntas tem uma linha por item.
+    """Parágrafo em linha única. A lista numerada é barrada em checa_entendimento.
 
     Decisão do usuário, 29/09/2026: texto corrido, sem quebra de linha no meio do
     parágrafo. Linha em branco entre parágrafos pode. Roda no texto antes de desdobrar.
@@ -538,8 +617,7 @@ def checa_quebra_de_linha(texto_bruto: str) -> list[Achado]:
                     Achado(
                         ERRO,
                         "título ou marcador",
-                        "A proposta é texto corrido: sem título e sem marcador. A única lista é a numeração "
-                        "das três perguntas ('1. ').",
+                        "A proposta é texto corrido: sem título, sem marcador e sem lista.",
                         _corta(l),
                     )
                 )
@@ -551,9 +629,7 @@ def checa_quebra_de_linha(texto_bruto: str) -> list[Achado]:
             Achado(
                 ERRO,
                 "quebra de linha no parágrafo",
-                "O parágrafo está quebrado em várias linhas. Cada parágrafo vai numa linha só, e cada "
-                "pergunta numerada também ('1. ', não '1)'). A frase que abre a lista precisa de uma linha "
-                "em branco antes do '1.'.",
+                "O parágrafo está quebrado em várias linhas. Cada parágrafo vai numa linha só.",
                 _corta(linhas[0]),
             )
         )
@@ -915,6 +991,8 @@ def varre(proposta: str, analise: str | None) -> list[Achado]:
     achados += checa_formatacao(proposta)
     achados += checa_compromisso_precoce(proposta)
     achados += checa_tamanho(proposta)
+    achados += checa_entendimento(proposta)
+    achados += checa_cumprimento(proposta)
     if analise is not None:
         achados += checa_status(analise)
         achados += checa_titulos_duplicados(analise)
@@ -935,8 +1013,8 @@ def relatorio(achados: list[Achado], palavras: int) -> str:
     linhas.append("")
 
     if not achados:
-        linhas.append("Nenhum achado mecânico. **Falta a leitura humana**: o gancho, o teste do aliado e a")
-        linhas.append("qualidade das três perguntas não são decidíveis por texto e continuam sendo suas.")
+        linhas.append("Nenhum achado mecânico. **Falta a leitura humana**: o gancho, o teste do aliado e o")
+        linhas.append("objetivo escrito no entendimento não são decidíveis por texto e continuam sendo seus.")
         return "\n".join(linhas)
 
     for titulo, grupo in (("Erros, que barram a entrega", erros), ("Alertas, que pedem decisão", alertas)):
@@ -950,8 +1028,8 @@ def relatorio(achados: list[Achado], palavras: int) -> str:
                 linhas.append(f"  > {a.trecho}")
         linhas.append("")
 
-    linhas.append("A varredura só cobre o que é decidível por texto. O gancho, o teste do aliado e a")
-    linhas.append("qualidade das três perguntas continuam sendo leitura sua.")
+    linhas.append("A varredura só cobre o que é decidível por texto. O gancho, o teste do aliado e o")
+    linhas.append("objetivo escrito no entendimento continuam sendo leitura sua.")
     return "\n".join(linhas)
 
 
@@ -983,7 +1061,7 @@ def main() -> None:
     analise = caminho_analise.read_text(encoding="utf-8") if caminho_analise and caminho_analise.exists() else None
 
     achados = varre(proposta, analise)
-    print(relatorio(achados, conta_palavras(proposta)))
+    print(relatorio(achados, conta_palavras(sem_cumprimento(proposta))))
     sys.exit(1 if any(a.nivel == ERRO for a in achados) else 0)
 
 

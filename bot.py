@@ -202,8 +202,10 @@ FORBIDDEN_RULES = (
     "Sem número de telas ou de funcionalidades (ex.: \"8 telas\", \"três funcionalidades\").",
     "Horas só as das etapas, pelos marcadores, e o prazo de resposta (\"respondo em até duas "
     "horas\"); nenhuma outra conta de horas, nem horas por semana.",
-    "Cada parágrafo numa linha só, com uma linha em branco entre eles, sem título nem marcador "
-    "de lista; só as três perguntas vão numeradas (\"1. \"), uma por linha.",
+    "Cada parágrafo numa linha só, com uma linha em branco entre eles, sem título, marcador nem "
+    "lista numerada.",
+    "O primeiro parágrafo é o cumprimento fixo, literal e sozinho. Ele é a única exceção aos "
+    "convites acima: o \"é só me chamar\" dele fica como está.",
     "A frase do pagamento que diz que algo é cobrado depois da entrega nomeia a entrada no "
     "mesmo parágrafo.",
     "A promessa de versão toda semana ou toda sexta vem ancorada na mesma frase: \"Dentro da "

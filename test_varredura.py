@@ -27,6 +27,10 @@ from varredura import (
     checa_cobranca_sem_entrada,
     checa_status,
     checa_tamanho,
+    checa_cumprimento,
+    CUMPRIMENTO,
+    checa_entendimento,
+    sem_cumprimento,
     checa_acessos,
     checa_titulos_duplicados,
     checa_unidade_de_divisao,
@@ -375,10 +379,10 @@ class TestTamanho(unittest.TestCase):
         self.assertEqual(checa_tamanho("palavra " * 300)[0].nivel, ALERTA)
 
     def test_longo_demais(self):
-        self.assertEqual(checa_tamanho("palavra " * 1100)[0].nivel, ALERTA)
+        self.assertEqual(checa_tamanho("palavra " * 900)[0].nivel, ALERTA)
 
     def test_na_faixa_passa(self):
-        self.assertEqual(checa_tamanho("palavra " * 850), [])
+        self.assertEqual(checa_tamanho("palavra " * 700), [])
 
 
 class TestAnalise(unittest.TestCase):
@@ -465,7 +469,7 @@ class TestValores(unittest.TestCase):
 
 class TestIntegracao(unittest.TestCase):
     def test_proposta_boa_nao_gera_erro(self):
-        proposta = MOVIMENTO_4_BOM + "\n\nO app, o código e as contas ficam no seu nome desde o começo."
+        proposta = CUMPRIMENTO + "\n\n" + MOVIMENTO_4_BOM + "\n\nO app, o código e as contas ficam no seu nome desde o começo."
         achados = varre(proposta, None)
         self.assertEqual([a for a in achados if a.nivel == ERRO], [])
 
@@ -499,6 +503,35 @@ class TestVarreComAnalise(unittest.TestCase):
 
 
 class TestUtilidades(unittest.TestCase):
+    def test_entendimento(self):
+        bom = (
+            "Pelo que você escreveu, eu entendi que você quer o pedido no sistema na hora. "
+            "É isso mesmo que você deseja? Se eu entendi algo errado, me corrige que eu ajusto.\n\n"
+            "Pelo que está escrito, o valor é R$ 4 800."
+        )
+        self.assertEqual(checa_entendimento(bom), [])
+        regras = {a.regra for a in checa_entendimento("O valor é R$ 4 800.")}
+        self.assertEqual(regras, {"falta o entendimento", "falta a pergunta do entendimento"})
+        com_lista = bom + "\n\n1. O pedido sai sem sinal?"
+        self.assertEqual([a.regra for a in checa_entendimento(com_lista)], ["perguntas no fim"])
+        # proposta curta, sem preço: não exige o entendimento literal, mas também não leva lista
+        self.assertEqual(checa_entendimento("Me confirma se eu entendi certo."), [])
+        curta_com_lista = "Preciso de três respostas:\n\n1. Uma?\n2. Outra?"
+        self.assertEqual([a.regra for a in checa_entendimento(curta_com_lista)], ["perguntas no fim"])
+
+    def test_cumprimento_literal(self):
+        self.assertEqual(checa_cumprimento(CUMPRIMENTO + "\n\nUma frase."), [])
+        variado = CUMPRIMENTO.replace("é precioso", "vale ouro")
+        self.assertEqual([a.regra for a in checa_cumprimento(variado + "\n\nUma frase.")], ["cumprimento fora do padrão"])
+        emendado = CUMPRIMENTO + " Pelo que você escreveu, eu entendi que você quer X."
+        self.assertEqual(len(checa_cumprimento(emendado)), 1)
+
+    def test_cumprimento_fora_da_conta(self):
+        abertura = CUMPRIMENTO
+        self.assertEqual(sem_cumprimento(abertura + "\n\nUma frase."), "Uma frase.")
+        self.assertEqual(sem_cumprimento("Uma frase.\n\nOutra."), "Uma frase.\n\nOutra.")
+        self.assertEqual(checa_tamanho(abertura + "\n\n" + "palavra " * 790), [])
+
     def test_conta_palavras(self):
         self.assertEqual(conta_palavras("  uma  duas   três "), 3)
         self.assertEqual(conta_palavras("fecho em R$ 12 000 e mais onze de R$ 870"), 10)
