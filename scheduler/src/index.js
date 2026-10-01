@@ -15,16 +15,6 @@ const JOBS = [
     // Every 15 min, all day
     shouldRun: () => true,
   },
-  {
-    name: "gupy",
-    repo: "leandrorochaadm/telegram-vagas-gupy-bot",
-    workflow: "vagas.yml",
-    shouldRun: ({ weekday, hour, minute }) => {
-      const isWeekend = weekday === 0 || weekday === 6;
-      if (isWeekend) return hour >= 10 && hour <= 18 && minute === 0; // hourly, 10h to 18h
-      return hour >= 8 && hour <= 20 && minute % 30 === 0; // every 30 min, 8h to 20h30
-    },
-  },
 ];
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
