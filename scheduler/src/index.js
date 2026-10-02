@@ -15,6 +15,18 @@ const JOBS = [
     // Every 15 min, all day
     shouldRun: () => true,
   },
+  {
+    name: "usage",
+    repo: "leandrorochaadm/workana-telegram-bot",
+    workflow: "usage.yml",
+    // Mon-Fri every 2h from 6h to 22h; Sat-Sun every 4h from 8h to 18h
+    shouldRun: ({ weekday, hour, minute }) => {
+      if (minute !== 0) return false;
+      const isWeekend = weekday === 0 || weekday === 6;
+      if (isWeekend) return hour >= 8 && hour <= 18 && (hour - 8) % 4 === 0;
+      return hour >= 6 && hour <= 22 && (hour - 6) % 2 === 0;
+    },
+  },
 ];
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
