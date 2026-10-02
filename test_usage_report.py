@@ -191,3 +191,92 @@ def test_main_sends_report_without_printing_it(monkeypatch, capsys) -> None:
     assert "32% usado" in text
     # Actions logs are public: the report itself must never reach stdout
     assert "32%" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("5h", "Janela de 5h"),
+        ("7d", "Limite semanal"),
+        ("7d_fable", "Limite semanal do Fable"),
+        ("7d-fable", "Limite semanal do Fable"),
+        ("5h_opus", "Janela de 5h do Opus"),
+        ("7d_oauth_apps", "Limite 7d_oauth_apps"),
+        ("overage", "Limite overage"),
+    ],
+)
+def test_window_label(key: str, expected: str) -> None:
+    assert usage_report.window_label(key) == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("5h", timedelta(hours=5)),
+        ("7d_fable", timedelta(days=7)),
+        ("overage", None),
+    ],
+)
+def test_window_length(key: str, expected: timedelta | None) -> None:
+    assert usage_report.window_length(key) == expected
+
+
+def test_elapsed_fraction_unknown_window_is_none() -> None:
+    assert usage_report.elapsed_fraction("overage", NOW, NOW) is None
+
+
+def test_fetch_usage_reads_per_model_limits(api) -> None:
+    prefix = usage_report.HEADER_PREFIX
+    headers = usage_headers() | {
+        f"{prefix}7d_fable-utilization": "0.25",
+        f"{prefix}7d_fable-reset": str(RESET_7D),
+        f"{prefix}status": "allowed",
+    }
+    api.state["response"] = fake_response(headers=headers)
+
+    usage = usage_report.fetch_usage("oauth")
+
+    assert set(usage) == {"5h", "7d", "7d_fable"}
+    assert usage["7d_fable"] == (0.25, usage_report.parse_reset(str(RESET_7D)))
+
+
+def test_format_message_lists_fable_after_main_windows() -> None:
+    reset_7d = usage_report.parse_reset(str(RESET_7D))
+    usage = {"7d_fable": (0.25, reset_7d), "5h": (0.32, None), "7d": (0.48, reset_7d)}
+
+    message = usage_report.format_message(usage, NOW)
+
+    assert message.endswith(
+        "\n".join(
+            [
+                "<b>Limite semanal do Fable</b>",
+                "█" * 5 + "░" * 15 + " 25% usado",
+                "█" * 10 + "░" * 10 + " 48% do tempo",
+                "Reinicia em 06/10 às 09:00",
+            ]
+        )
+    )
+    assert message.index("Janela de 5h") < message.index("Limite semanal<") < message.index("Fable")
+
+
+def test_format_message_unknown_window_has_no_time_bar() -> None:
+    message = usage_report.format_message({"overage": (0.1, NOW + timedelta(hours=1))}, NOW)
+
+    assert "<b>Limite overage</b>" in message
+    assert "do tempo" not in message
+    assert "Reinicia em 02/10 às 18:00" in message
+
+
+def test_main_logs_only_limit_names(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    usage = {"7d_fable": (0.25, None), "5h": (0.32, None)}
+    monkeypatch.setattr(usage_report, "fetch_usage", lambda token: usage)
+    monkeypatch.setattr(usage_report, "send_telegram", lambda *args: None)
+
+    usage_report.main()
+
+    out = capsys.readouterr().out
+    assert "Limites encontrados: 5h, 7d_fable" in out
+    assert "%" not in out
