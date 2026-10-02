@@ -67,7 +67,7 @@ def parse_reset(value: str | None) -> datetime | None:
         return None
 
 
-def progress_bar(fraction: float, width: int = 10) -> str:
+def progress_bar(fraction: float, width: int = 20) -> str:
     filled = round(min(max(fraction, 0), 1) * width)
     return "█" * filled + "░" * (width - filled)
 
