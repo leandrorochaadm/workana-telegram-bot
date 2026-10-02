@@ -89,7 +89,7 @@ def _project(pid: str, title: str) -> dict[str, str]:
 def sent(monkeypatch):
     messages: list[str] = []
 
-    def fake_send(token: str, chat_id: str, text: str, html_mode: bool = True) -> None:
+    def fake_send(token: str, chat_id: str, text: str) -> None:
         assert (token, chat_id) == ("tok", "42")
         if "FALHA" in text:
             raise requests.ConnectionError("offline")
@@ -222,6 +222,8 @@ def with_proposals(workdir, monkeypatch):
             raise RuntimeError("boom")
         if "vencido" in project["title"]:
             raise bot.ProposalError("claude saiu com código 1 (api_error_status=401)")
+        if "longo" in project["title"]:
+            raise bot.ProposalTooLong("proposta passa 300 caracteres do limite do Telegram")
         if "inesperado" in project["title"]:
             raise ValueError("saída do modelo com texto sigiloso")
         return PROPOSAL
@@ -240,7 +242,7 @@ def with_proposals(workdir, monkeypatch):
     return calls
 
 
-def test_main_sends_proposal_after_notification(with_proposals, sent, monkeypatch) -> None:
+def test_main_sends_proposal_in_notification(with_proposals, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
 
     bot.main()
@@ -248,9 +250,9 @@ def test_main_sends_proposal_after_notification(with_proposals, sent, monkeypatc
     [(system, description)] = with_proposals
     assert system == "prompt secreto\n\n" + bot.forbidden_wording_prompt()
     assert description == "descrição de https://www.workana.com/job/x"
-    assert len(sent) == 2
+    assert len(sent) == 1
     assert "R$ 4.800" in sent[0] and "R$ 4.000" in sent[0]
-    assert sent[1] == "Olá! Proposta <texto>"
+    assert sent[0].endswith("Olá! Proposta &lt;texto&gt;")
 
 
 def test_main_defers_failed_proposal_to_next_run(with_proposals, sent, monkeypatch) -> None:
@@ -276,6 +278,21 @@ def test_main_sends_without_proposal_after_max_attempts(with_proposals, sent, mo
     assert bot.load_pending() == {}
 
 
+def test_main_tells_size_was_the_reason_without_another_run(
+    with_proposals, sent, monkeypatch
+) -> None:
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App longo")])
+
+    bot.main()
+
+    assert len(with_proposals) == 1
+    [alert] = sent
+    assert "longa demais para caber numa mensagem do Telegram" in alert
+    assert "erro ao ler a vaga" not in alert
+    assert bot.load_seen() == {"x"}
+    assert bot.load_pending() == {}
+
+
 def test_main_retries_pending_job_that_left_the_listing(with_proposals, sent, monkeypatch) -> None:
     project = _project("x", "App antigo")
     bot.save_pending({"x": {"title": project["title"], "url": project["url"], "attempts": 1}})
@@ -283,7 +300,7 @@ def test_main_retries_pending_job_that_left_the_listing(with_proposals, sent, mo
 
     bot.main()
 
-    assert len(sent) == 2
+    assert len(sent) == 1
     assert "App antigo" in sent[0]
     assert bot.load_seen() == {"x"}
     assert bot.load_pending() == {}
@@ -298,7 +315,7 @@ def test_main_caps_proposals_per_run(with_proposals, sent, monkeypatch) -> None:
     bot.main()
 
     assert len(with_proposals) == 1
-    assert len(sent) == 2  # alert + proposal for "a" only
+    assert len(sent) == 1  # alert with proposal for "a" only
     assert bot.load_seen() == {"a"}
     assert bot.load_pending() == {"b": {"title": "App b", "url": "https://www.workana.com/job/b", "attempts": 0}}
 
@@ -354,7 +371,7 @@ def test_main_generates_proposal_when_triage_fails(
     bot.main()
 
     assert len(with_proposals) == 1
-    assert len(sent) == 2
+    assert len(sent) == 1
     err = capsys.readouterr().err
     assert "Triagem falhou" in err and "ValueError" in err
     assert "sigiloso" not in err
@@ -414,6 +431,21 @@ def test_split_message_respects_limit() -> None:
     assert bot.split_message("x" * 250, limit=100) == ["x" * 100, "x" * 100, "x" * 50]
 
 
+def test_split_message_counts_emoji_as_two_units() -> None:
+    # Telegram counts UTF-16 units: 60 emojis take 120 of the 100 allowed
+    chunks = bot.split_message("🆕" * 60, limit=100)
+    assert chunks == ["🆕" * 50, "🆕" * 10]
+    # A limit smaller than one emoji still ends, one character per chunk
+    assert bot.split_message("🆕🆕", limit=1) == ["🆕", "🆕"]
+
+
+def test_split_message_never_cuts_an_html_entity() -> None:
+    text = "a" * 95 + " &amp;" + " b" * 20
+    chunks = bot.split_message(text, limit=100)
+    assert chunks[0] == "a" * 95
+    assert chunks[1].startswith("&amp;")
+
+
 def test_main_survives_unexpected_error_without_leaking_it(
     with_proposals, sent, monkeypatch, capsys
 ) -> None:
@@ -427,13 +459,12 @@ def test_main_survives_unexpected_error_without_leaking_it(
     assert "sigiloso" not in err
 
 
-def test_main_keeps_job_pending_when_proposal_send_fails(with_proposals, monkeypatch) -> None:
+def test_main_keeps_job_pending_when_send_with_proposal_fails(with_proposals, monkeypatch) -> None:
     messages: list[str] = []
 
-    def fake_send(_token, _chat_id, text, html_mode=True):
-        if not html_mode:
-            raise requests.ConnectionError("offline")
+    def fake_send(_token, _chat_id, text):
         messages.append(text)
+        raise requests.ConnectionError("offline")
 
     monkeypatch.setattr(bot, "send_telegram", fake_send)
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
@@ -596,6 +627,11 @@ def test_generate_proposal_ignores_alerts(monkeypatch, rates) -> None:
     assert len(calls) == 1
 
 
+def test_proposal_prompt_runs_at_most_twice() -> None:
+    # One draft plus one revision per job
+    assert bot.MAX_REVISIONS == 1
+
+
 def test_generate_proposal_stops_after_max_revisions(monkeypatch, rates) -> None:
     calls = _fake_claude(monkeypatch, output=_answer(proposal=DRAFT_TEXT + " Pronto — publicado."))
 
@@ -624,7 +660,7 @@ def test_generate_proposal_keeps_previous_draft_when_revision_breaks_markers(
 
     result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
-    assert len(calls) == 3
+    assert len(calls) == 1 + bot.MAX_REVISIONS
     assert "Pronto — publicado." in result.proposal
     assert result.review[0].startswith("ERRO: travessão")
 
@@ -663,6 +699,39 @@ def test_generate_proposal_raises_when_first_draft_unusable_and_revision_fails(
 
     with pytest.raises(bot.ProposalError, match="código 1"):
         bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
+
+LONG_TEXT = DRAFT_TEXT + "\n\n" + "palavra " * 700
+
+
+def test_generate_proposal_revises_proposal_too_long_for_one_message(monkeypatch, rates) -> None:
+    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal=LONG_TEXT), _answer()])
+
+    result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
+    assert len(calls) == 2
+    assert "proposta longa demais" in calls[1]["input"]
+    assert bot.message_excess(result, _project("x", "App")) <= 0
+
+
+def test_generate_proposal_never_returns_proposal_too_long(monkeypatch, rates) -> None:
+    calls = _fake_claude(monkeypatch, output=_answer(proposal=LONG_TEXT))
+
+    # Raised so main redoes the job on the next run instead of splitting the alert
+    with pytest.raises(bot.ProposalTooLong, match="limite do Telegram"):
+        bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+    assert len(calls) == 1 + bot.MAX_REVISIONS
+
+
+def test_generate_proposal_falls_back_to_the_last_draft_that_fits(monkeypatch, rates) -> None:
+    # The revision fixes the dash but overflows: the first draft still goes out
+    first = DRAFT_TEXT + " Pronto — publicado."
+    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal=first), _answer(proposal=LONG_TEXT)])
+
+    result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
+    assert len(calls) == 2
+    assert "Pronto — publicado." in result.proposal
 
 
 def test_generate_proposal_raises_when_markers_stay_wrong(monkeypatch, rates) -> None:
@@ -782,7 +851,46 @@ def test_review_proposal_lists_errors_before_alerts() -> None:
     assert any("travessão" in item for item in review)
     # A link is only an alert in varredura.py, but it suspends the Workana account
     assert any(item.startswith("ERRO: endereço no texto") for item in review)
-    assert any(item.startswith("alerta: abaixo de 600 palavras") for item in review)
+    assert any(item.startswith(f"alerta: abaixo de {bot.PROPOSAL_MIN_CHARS} caracteres") for item in review)
+    # varredura.py's 600-800 range does not fit one Telegram message
+    assert not any("600 palavras" in item for item in review)
+
+
+def test_scan_counts_characters_not_words() -> None:
+    # Above varredura.py's 800 words, so its word rule fires there and must not here
+    text = varredura.CUMPRIMENTO + "\n\n" + "palavra " * 900
+    assert varredura.checa_tamanho(text)
+    assert not any("caracteres" in f.regra or "palavras" in f.regra for f in bot.scan_proposal(text))
+
+
+def test_scan_accepts_proposal_within_size() -> None:
+    text = varredura.CUMPRIMENTO + "\n\n" + "palavra " * 400
+    assert bot.PROPOSAL_MIN_CHARS <= bot.utf16_len(text) <= bot.PROPOSAL_TARGET_CHARS
+    assert not any("caracteres" in f.regra or "palavras" in f.regra for f in bot.scan_proposal(text))
+
+
+def test_proposal_problems_asks_to_cut_what_overflows_the_message(rates) -> None:
+    project = _project("x", "App")
+    _, problems = bot.proposal_problems(_draft(), project)
+    assert not any("longa demais" in problem for problem in problems)
+
+    long_draft = _draft(proposal=DRAFT_TEXT + "\n\n" + "palavra " * 600)
+    _, problems = bot.proposal_problems(long_draft, project)
+    [problem] = [p for p in problems if "longa demais" in p]
+    alert = bot.format_notification(project, bot.price_proposal(long_draft), None)
+    excess = bot.telegram_len(alert) - bot.TELEGRAM_MAX_CHARS
+    assert f"passa {excess} caracteres" in problem
+    assert f"Corte cerca de {excess + bot.REVISION_MARGIN_CHARS} caracteres" in problem
+
+
+def test_telegram_len_counts_text_after_parsing() -> None:
+    assert bot.telegram_len("<b>Preço:</b> R$ 1 &amp; 2 🆕") == len("Preço: R$ 1 & 2 ") + 2
+
+
+def test_split_message_keeps_message_whose_tags_pass_the_limit() -> None:
+    # 100 raw characters, but only 90 once Telegram strips the tags
+    text = "<b>x</b>" + "y" * 85 + "<b></b>"
+    assert bot.split_message(text, limit=95) == [text]
 
 
 @pytest.mark.parametrize(
@@ -1028,7 +1136,7 @@ def test_main_stops_proposals_after_deadline(with_proposals, sent, monkeypatch) 
 
 
 def test_main_saves_seen_after_each_alert(workdir, monkeypatch) -> None:
-    def send_then_die(_token, _chat_id, text, html_mode=True):
+    def send_then_die(_token, _chat_id, text):
         if "App b" in text:
             raise KeyboardInterrupt  # what a workflow timeout looks like to the script
 
@@ -1073,3 +1181,10 @@ def test_open_browser_routes_through_browser_proxy(monkeypatch, proxy, expected)
         pass
 
     assert launches == [{"headless": True, "proxy": expected}]
+
+
+def test_words_hint_lands_inside_the_character_limits() -> None:
+    # 5.6 characters per word, space included, is the average of the skill's own texts
+    greeting = len(varredura.CUMPRIMENTO) + 2
+    low, high = (greeting + round(words * bot.CHARS_PER_WORD) for words in bot.PROPOSAL_WORDS_HINT)
+    assert bot.PROPOSAL_MIN_CHARS <= low and high <= bot.PROPOSAL_TARGET_CHARS
