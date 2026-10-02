@@ -81,6 +81,9 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
   `MAX_PROPOSALS_PER_RUN` (5) propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é
   tentada de novo na próxima execução, mesmo que já tenha saído da lista da Workana.
 - Depois de `MAX_PROPOSAL_ATTEMPTS` (3) falhas, a vaga chega sem proposta, com um aviso.
+- Cada envio ao Telegram é tentado até `TELEGRAM_SEND_ATTEMPTS` (3) vezes. Se o alerta sair
+  e a proposta não, ela fica no `pending.json` criptografada com a `PROMPT_KEY` (o repositório
+  é público), e a próxima execução manda só a proposta, sem repetir o alerta nem gerar outra.
 - Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`
   ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
 

@@ -56,6 +56,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "PENDING_FILE", tmp_path / "pending.json")
     monkeypatch.setattr(bot, "REJECTED_FILE", tmp_path / "rejected.json")
     monkeypatch.setattr(bot, "PROMPT_FILE", tmp_path / "proposal_prompt.enc")
+    monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
     for var in (
         "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
         "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY", "PRICE_HOURLY_RATE", "PRICE_MIN_PROJECT",
@@ -242,7 +243,7 @@ def with_proposals(workdir, monkeypatch):
     return calls
 
 
-def test_main_sends_proposal_in_notification(with_proposals, sent, monkeypatch) -> None:
+def test_main_sends_proposal_alone_after_alert(with_proposals, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
 
     bot.main()
@@ -250,9 +251,11 @@ def test_main_sends_proposal_in_notification(with_proposals, sent, monkeypatch) 
     [(system, description)] = with_proposals
     assert system == "prompt secreto\n\n" + bot.forbidden_wording_prompt()
     assert description == "descrição de https://www.workana.com/job/x"
-    assert len(sent) == 1
-    assert "R$ 4.800" in sent[0] and "R$ 4.000" in sent[0]
-    assert sent[0].endswith("Olá! Proposta &lt;texto&gt;")
+    alert, proposal = sent
+    assert "R$ 4.800" in alert and "R$ 4.000" in alert
+    assert "Olá!" not in alert
+    # Only the proposal text, to paste to the client as is
+    assert proposal == "Olá! Proposta &lt;texto&gt;"
 
 
 def test_main_defers_failed_proposal_to_next_run(with_proposals, sent, monkeypatch) -> None:
@@ -300,7 +303,7 @@ def test_main_retries_pending_job_that_left_the_listing(with_proposals, sent, mo
 
     bot.main()
 
-    assert len(sent) == 1
+    assert len(sent) == 2  # alert and proposal
     assert "App antigo" in sent[0]
     assert bot.load_seen() == {"x"}
     assert bot.load_pending() == {}
@@ -315,7 +318,7 @@ def test_main_caps_proposals_per_run(with_proposals, sent, monkeypatch) -> None:
     bot.main()
 
     assert len(with_proposals) == 1
-    assert len(sent) == 1  # alert with proposal for "a" only
+    assert len(sent) == 2  # alert and proposal for "a" only
     assert bot.load_seen() == {"a"}
     assert bot.load_pending() == {"b": {"title": "App b", "url": "https://www.workana.com/job/b", "attempts": 0}}
 
@@ -355,7 +358,7 @@ def test_main_generates_proposal_when_triage_fails(
     bot.main()
 
     assert len(with_proposals) == 1
-    assert len(sent) == 1
+    assert len(sent) == 2
     err = capsys.readouterr().err
     assert "Triagem falhou" in err and "ValueError" in err
     assert "sigiloso" not in err
@@ -457,10 +460,106 @@ def test_main_keeps_job_pending_when_send_with_proposal_fails(with_proposals, mo
         bot.main()
 
     assert exc.value.code == 1
-    assert len(messages) == 1
+    assert len(messages) == bot.TELEGRAM_SEND_ATTEMPTS
     # Retried next run so the proposal is not lost
     assert bot.load_seen() == set()
     assert "x" in bot.load_pending()
+    assert "unsent_proposal" not in bot.load_pending()["x"]
+
+
+def _fail_proposal_send(monkeypatch, messages: list[str]) -> None:
+    """The alert goes out, the proposal message never does."""
+
+    def fake_send(_token, _chat_id, text):
+        if text.startswith("Olá!"):
+            raise requests.ConnectionError("offline")
+        messages.append(text)
+
+    monkeypatch.setattr(bot, "send_telegram", fake_send)
+
+
+def test_main_resends_only_the_proposal_when_it_failed_after_the_alert(
+    with_proposals, sent, monkeypatch
+) -> None:
+    first_run: list[str] = []
+    _fail_proposal_send(monkeypatch, first_run)
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+
+    with pytest.raises(SystemExit):
+        bot.main()
+
+    assert len(first_run) == 1 and "App novo" in first_run[0]
+    stored = bot.load_pending()["x"]["unsent_proposal"]
+    # The repo is public: the stored message must not be readable
+    assert "Proposta" not in bot.PENDING_FILE.read_text()
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, text: sent.append(text))
+    bot.main()
+
+    assert sent == ["Olá! Proposta &lt;texto&gt;"]
+    assert len(with_proposals) == 1  # no second proposal
+    assert stored and bot.load_seen() == {"x"}
+    assert bot.load_pending() == {}
+
+
+def test_main_makes_a_fresh_proposal_when_the_stored_one_is_unreadable(
+    with_proposals, sent, monkeypatch
+) -> None:
+    other_key = Fernet(Fernet.generate_key())
+    bot.save_pending({
+        "x": {
+            "title": "App novo",
+            "url": "https://www.workana.com/job/x",
+            "attempts": 0,
+            "unsent_proposal": other_key.encrypt(b"velha").decode(),
+        }
+    })
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [])
+
+    bot.main()
+
+    assert len(with_proposals) == 1
+    alert, proposal = sent
+    assert "App novo" in alert
+    assert proposal == "Olá! Proposta &lt;texto&gt;"
+    assert bot.load_pending() == {}
+
+
+def _http_error(status: int) -> requests.HTTPError:
+    return requests.HTTPError(response=SimpleNamespace(status_code=status))
+
+
+@pytest.mark.parametrize(
+    "error", [requests.ConnectionError("offline"), _http_error(429), _http_error(502)]
+)
+def test_send_with_retry_tries_again_on_passing_errors(monkeypatch, error) -> None:
+    monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
+    calls: list[str] = []
+
+    def flaky(_token, _chat_id, text):
+        calls.append(text)
+        if len(calls) == 1:
+            raise error
+
+    monkeypatch.setattr(bot, "send_telegram", flaky)
+
+    bot.send_with_retry("tok", "42", "oi")
+
+    assert calls == ["oi", "oi"]
+
+
+def test_send_with_retry_gives_up_at_once_on_bad_request(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def bad(_token, _chat_id, text):
+        calls.append(text)
+        raise _http_error(400)
+
+    monkeypatch.setattr(bot, "send_telegram", bad)
+
+    with pytest.raises(requests.HTTPError):
+        bot.send_with_retry("tok", "42", "oi")
+    assert calls == ["oi"]
 
 
 def test_format_notification_escapes_proposal_fields() -> None:
@@ -695,7 +794,7 @@ def test_generate_proposal_revises_proposal_too_long_for_one_message(monkeypatch
 
     assert len(calls) == 2
     assert "proposta longa demais" in calls[1]["input"]
-    assert bot.message_excess(result, _project("x", "App")) <= 0
+    assert bot.message_excess(result) <= 0
 
 
 def test_generate_proposal_never_returns_proposal_too_long(monkeypatch, rates) -> None:
@@ -854,15 +953,14 @@ def test_scan_accepts_proposal_within_size() -> None:
 
 
 def test_proposal_problems_asks_to_cut_what_overflows_the_message(rates) -> None:
-    project = _project("x", "App")
-    _, problems = bot.proposal_problems(_draft(), project)
+    _, problems = bot.proposal_problems(_draft())
     assert not any("longa demais" in problem for problem in problems)
 
     long_draft = _draft(proposal=DRAFT_TEXT + "\n\n" + "palavra " * 600)
-    _, problems = bot.proposal_problems(long_draft, project)
+    _, problems = bot.proposal_problems(long_draft)
     [problem] = [p for p in problems if "longa demais" in p]
-    alert = bot.format_notification(project, bot.price_proposal(long_draft), None)
-    excess = bot.telegram_len(alert) - bot.TELEGRAM_MAX_CHARS
+    message = bot.format_proposal(bot.price_proposal(long_draft))
+    excess = bot.telegram_len(message) - bot.TELEGRAM_MAX_CHARS
     assert f"passa {excess} caracteres" in problem
     assert f"Corte cerca de {excess + bot.REVISION_MARGIN_CHARS} caracteres" in problem
 
