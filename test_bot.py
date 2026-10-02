@@ -320,35 +320,19 @@ def test_main_caps_proposals_per_run(with_proposals, sent, monkeypatch) -> None:
     assert bot.load_pending() == {"b": {"title": "App b", "url": "https://www.workana.com/job/b", "attempts": 0}}
 
 
-def test_main_sends_rejected_job_without_proposal(with_proposals, sent, monkeypatch) -> None:
+def test_main_skips_rejected_job_silently(with_proposals, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App de logo")])
 
     bot.main()
 
     assert with_proposals == []
-    assert len(sent) == 1
-    assert "Fora do seu perfil" in sent[0] and "Preço" not in sent[0]
+    assert sent == []
     assert bot.load_seen() == {"x"}
     assert bot.load_pending() == {}
     [(pid, job)] = bot.load_rejected().items()
     assert pid == "x"
     assert "reason" not in job
     assert job["url"] == "https://www.workana.com/job/x" and job["date"]
-
-
-def test_main_does_not_queue_rejected_job_when_send_fails(with_proposals, monkeypatch) -> None:
-    def fake_send(*_args, **_kwargs):
-        raise requests.ConnectionError("fora do ar")
-
-    monkeypatch.setattr(bot, "send_telegram", fake_send)
-    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App de logo")])
-
-    with pytest.raises(SystemExit):
-        bot.main()
-
-    assert bot.load_seen() == {"x"}
-    assert bot.load_pending() == {}
-    assert "x" in bot.load_rejected()
 
 
 def test_main_rejected_job_keeps_proposal_budget(with_proposals, sent, monkeypatch) -> None:

@@ -72,10 +72,10 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
 
 - Antes da proposta, o Haiku (`claude-haiku-4-5-20251001`) faz uma triagem e responde só sim ou
   não: a vaga precisa ser um app mobile ou um sistema web com telas. Landing page, site, loja
-  pronta, só design, bot, automação etc. chegam no Telegram como "Fora do seu perfil", sem
-  proposta, e não gastam o limite de propostas da execução. A vaga rejeitada vai para o
+  pronta, só design, bot, automação etc. são ignoradas: não chegam no Telegram, não seguem para
+  a proposta e não gastam o limite de propostas da execução. A vaga rejeitada vai para o
   `seen.json` e para o `rejected.json` (título, link e data, para ajustar os critérios) e nunca
-  é tentada de novo, nem se o aviso falhar. Se a triagem falhar, a proposta é gerada mesmo assim. Os critérios
+  é tentada de novo. Se a triagem falhar, a proposta é gerada mesmo assim. Os critérios
   ficam em `FIT_PROMPT`, no `bot.py`.
 - A vaga que passa na triagem só é avisada junto com a proposta. Se passar do limite de
   `MAX_PROPOSALS_PER_RUN` (5) propostas ou do tempo da execução, ou se a geração falhar, ela fica em `pending.json` e é

@@ -748,7 +748,6 @@ def format_notification(
     project: dict[str, str],
     proposal: Proposal | None,
     error: str | None,
-    off_profile: bool = False,
 ) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
     if proposal:
@@ -764,8 +763,6 @@ def format_notification(
                 f"\n• {html.escape(item)}" for item in proposal.review
             )
         text += f"\n\n✍️ <b>Proposta:</b>\n{html.escape(proposal.proposal)}"
-    elif off_profile:
-        text += "\n\n🚫 Fora do seu perfil, sem proposta."
     elif error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
@@ -940,7 +937,7 @@ def main() -> None:
                     else:
                         error = "erro ao ler a vaga ou falar com o Claude"
             if off_profile:
-                # Saved before the alert, so a failed send cannot queue the job for another try
+                # Silently dropped: no Telegram alert and no proposal for a rejected job
                 rejected[project["id"]] = {
                     "title": project["title"],
                     "url": project["url"],
@@ -950,22 +947,18 @@ def main() -> None:
                 pending.pop(project["id"], None)
                 save_state()
                 turned_down += 1
+                continue
             try:
                 # One message with the proposal: generate_proposal never returns one that
                 # does not fit, so the split only guards an unforeseen overflow
-                for chunk in split_message(
-                    format_notification(project, proposal, error, off_profile)
-                ):
+                for chunk in split_message(format_notification(project, proposal, error)):
                     send_telegram(token, chat_id, chunk)
             except requests.RequestException as exc:
                 failed += 1
                 print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
-                if not off_profile:
-                    # Stays pending: the next run re-sends the whole alert, proposal included
-                    pending[project["id"]] = _pending_entry(project)
-                    save_state()
-                continue
-            if off_profile:
+                # Stays pending: the next run re-sends the whole alert, proposal included
+                pending[project["id"]] = _pending_entry(project)
+                save_state()
                 continue
             seen.add(project["id"])
             pending.pop(project["id"], None)
