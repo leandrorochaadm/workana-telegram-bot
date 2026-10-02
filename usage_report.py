@@ -11,7 +11,7 @@ any request made with the OAuth token. A 1-token Haiku call is enough to read th
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -20,6 +20,7 @@ LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 PROBE_MODEL = "claude-haiku-4-5-20251001"
 HEADER_PREFIX = "anthropic-ratelimit-unified-"
 WINDOWS = {"5h": "Janela de 5h", "7d": "Limite semanal"}
+WINDOW_LENGTHS = {"5h": timedelta(hours=5), "7d": timedelta(days=7)}
 
 
 def fetch_usage(oauth_token: str) -> dict[str, tuple[float, datetime | None]]:
@@ -72,15 +73,26 @@ def progress_bar(fraction: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def format_message(usage: dict[str, tuple[float, datetime | None]]) -> str:
+def elapsed_fraction(key: str, reset_at: datetime, now: datetime) -> float:
+    # The window started one full length before its reset
+    length = WINDOW_LENGTHS[key]
+    return 1 - (reset_at - now) / length
+
+
+def format_message(
+    usage: dict[str, tuple[float, datetime | None]], now: datetime | None = None
+) -> str:
+    now = now or datetime.now(LOCAL_TZ)
     lines = ["<b>Uso do Claude</b>"]
     for key, label in WINDOWS.items():
         if key not in usage:
             lines.append(f"\n<b>{label}</b>\nSem dados.")
             continue
         fraction, reset_at = usage[key]
-        lines.append(f"\n<b>{label}</b>\n{progress_bar(fraction)} {fraction:.0%}")
+        lines.append(f"\n<b>{label}</b>\n{progress_bar(fraction)} {fraction:.0%} usado")
         if reset_at:
+            elapsed = min(max(elapsed_fraction(key, reset_at, now), 0), 1)
+            lines.append(f"{progress_bar(elapsed)} {elapsed:.0%} do tempo")
             lines.append(f"Reinicia em {reset_at:%d/%m às %H:%M}")
     return "\n".join(lines)
 
