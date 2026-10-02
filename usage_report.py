@@ -75,8 +75,8 @@ def progress_bar(fraction: float, width: int = 20) -> str:
 
 def elapsed_fraction(key: str, reset_at: datetime, now: datetime) -> float:
     # The window started one full length before its reset
-    length = WINDOW_LENGTHS[key]
-    return 1 - (reset_at - now) / length
+    elapsed = 1 - (reset_at - now) / WINDOW_LENGTHS[key]
+    return min(max(elapsed, 0), 1)
 
 
 def format_message(
@@ -91,7 +91,7 @@ def format_message(
         fraction, reset_at = usage[key]
         lines.append(f"\n<b>{label}</b>\n{progress_bar(fraction)} {fraction:.0%} usado")
         if reset_at:
-            elapsed = min(max(elapsed_fraction(key, reset_at, now), 0), 1)
+            elapsed = elapsed_fraction(key, reset_at, now)
             lines.append(f"{progress_bar(elapsed)} {elapsed:.0%} do tempo")
             lines.append(f"Reinicia em {reset_at:%d/%m às %H:%M}")
     return "\n".join(lines)
