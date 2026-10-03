@@ -101,14 +101,14 @@ TELEGRAM_RETRY_SECONDS = 2
 # The proposal goes out alone, after the alert, so it can be copied straight to the
 # client; it must fit one Telegram message. The revision loop shortens what goes over
 # and the code never trims the text. These replace varredura.py's 600-800 word range
-PROPOSAL_MIN_CHARS = 2800
-# The prompt's ceiling, kept below the limit as a margin for Claude's estimate
-PROPOSAL_TARGET_CHARS = 3400
+PROPOSAL_MIN_CHARS = 3890
+# The prompt's ceiling, just under the limit: the message uses all of it
+PROPOSAL_TARGET_CHARS = 4090
 # Average of the skill's own texts, space included
 CHARS_PER_WORD = 5.6
 # Only a guide for Claude, which estimates words far better than characters: at
 # CHARS_PER_WORD, plus the greeting, this range lands inside the target
-PROPOSAL_WORDS_HINT = (470, 570)
+PROPOSAL_WORDS_HINT = (670, 695)
 # Asked on top of the overflow, since Claude cuts by eye and tends to fall short
 REVISION_MARGIN_CHARS = 150
 
@@ -236,8 +236,8 @@ FORBIDDEN_RULES = (
     "Não prometa acesso, senha ou credencial ao cliente desde o começo ou durante o projeto, "
     "e não explique quando os acessos são entregues.",
     f"Tamanho: o texto inteiro, já com preço e horas, tem entre {PROPOSAL_MIN_CHARS} e "
-    f"{PROPOSAL_TARGET_CHARS} caracteres contando espaços, para caber numa mensagem só. Use o "
-    "espaço: perto do teto é melhor que perto do piso. Como "
+    f"{PROPOSAL_TARGET_CHARS} caracteres contando espaços, para caber numa mensagem só. "
+    "A faixa é estreita: mire no meio dela, sem passar do teto. Como "
     f"referência, isso dá cerca de {PROPOSAL_WORDS_HINT[0]} a {PROPOSAL_WORDS_HINT[1]} palavras "
     "depois do cumprimento. Esta faixa vence qualquer outra faixa de tamanho do sistema. "
     "Para caber, encurte o porquê de cada etapa e junte frases, sem tirar etapa, preço, prazo "
@@ -497,6 +497,15 @@ def proposal_problems(draft: ProposalDraft) -> tuple[bool, list[str]]:
             f"de {TELEGRAM_MAX_CHARS} do Telegram. Corte cerca de {cut} caracteres, umas "
             f"{math.ceil(cut / CHARS_PER_WORD)} palavras, encurtando o porquê de cada etapa e "
             "juntando frases, sem tirar etapa, preço, prazo ou pergunta."
+        )
+    # A job too vague to price gets the short version on purpose: no padding for it
+    elif draft.dev_hours > 0 and (short := PROPOSAL_MIN_CHARS - utf16_len(proposal.proposal)) > 0:
+        add = short + REVISION_MARGIN_CHARS
+        problems.append(
+            f"proposta curta demais: tem {utf16_len(proposal.proposal)} caracteres, abaixo do "
+            f"piso de {PROPOSAL_MIN_CHARS}. Acrescente cerca de {add} caracteres, umas "
+            f"{math.ceil(add / CHARS_PER_WORD)} palavras, explicando melhor o porquê de cada "
+            f"etapa, sem passar de {PROPOSAL_TARGET_CHARS} caracteres."
         )
     return True, problems
 

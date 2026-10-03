@@ -701,13 +701,39 @@ def test_generate_proposal_revises_wrong_markers(monkeypatch, rates) -> None:
     assert "{{" not in result.proposal
 
 
-def test_generate_proposal_ignores_alerts(monkeypatch, rates) -> None:
-    # Too short is only an alert: no revision for it
+def test_generate_proposal_asks_to_lengthen_short_priced_proposal(monkeypatch, rates) -> None:
     calls = _fake_claude(monkeypatch, output=_answer())
 
     bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
+    assert len(calls) == 2
+    assert "proposta curta demais" in calls[1]["input"]
+
+
+def test_proposal_problems_asks_to_add_what_lands_inside_the_range(rates) -> None:
+    draft = _draft()
+    units = bot.utf16_len(bot.price_proposal(draft).proposal)
+    _, problems = bot.proposal_problems(draft)
+
+    [problem] = [p for p in problems if "curta demais" in p]
+    add = bot.PROPOSAL_MIN_CHARS - units + bot.REVISION_MARGIN_CHARS
+    assert f"tem {units} caracteres" in problem
+    assert f"Acrescente cerca de {add} caracteres" in problem
+    assert units + add <= bot.PROPOSAL_TARGET_CHARS
+
+
+def test_generate_proposal_keeps_short_version_of_job_too_vague_to_price(
+    monkeypatch, rates
+) -> None:
+    # The short version is on purpose: lengthening it would only pad the text
+    text = varredura.CUMPRIMENTO + "\n\nMe responde essas três."
+    vague = _answer(proposal=text, dev_hours=0, screens=0)
+    calls = _fake_claude(monkeypatch, output=vague)
+
+    result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
+
     assert len(calls) == 1
+    assert any("abaixo de" in item for item in result.review)
 
 
 def test_proposal_prompt_runs_at_most_twice() -> None:
@@ -947,7 +973,7 @@ def test_scan_counts_characters_not_words() -> None:
 
 
 def test_scan_accepts_proposal_within_size() -> None:
-    text = varredura.CUMPRIMENTO + "\n\n" + "palavra " * 400
+    text = varredura.CUMPRIMENTO + "\n\n" + "palavra " * 480
     assert bot.PROPOSAL_MIN_CHARS <= bot.utf16_len(text) <= bot.PROPOSAL_TARGET_CHARS
     assert not any("caracteres" in f.regra or "palavras" in f.regra for f in bot.scan_proposal(text))
 
