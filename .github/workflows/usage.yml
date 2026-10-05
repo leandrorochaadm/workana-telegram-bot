@@ -18,7 +18,9 @@ jobs:
 
       - name: Send usage report
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Usage goes to @leandro_claude_notify_bot, not to the job alerts bot.
+          # A private chat id is the user id, so it falls back to the main chat id.
+          TELEGRAM_TOKEN: ${{ secrets.USAGE_TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.USAGE_TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: uv run --script usage_report.py

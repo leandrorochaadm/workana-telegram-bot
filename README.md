@@ -14,6 +14,7 @@ Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
 - Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`)
+- O relatório de uso do Claude (`usage.yml`) vai para o bot [@leandro_claude_notify_bot](https://t.me/leandro_claude_notify_bot): secret `USAGE_TELEGRAM_TOKEN` (token do BotFather) e, se o chat for outro, `USAGE_TELEGRAM_CHAT_ID` (sem ele, usa o `TELEGRAM_CHAT_ID`)
 - Variables: `KEYWORDS` (ex: `aplicativo,app`) e, opcional, `EXCLUDE_KEYWORDS` (ex: `jogo,wordpress,no code`)
 
 Para trocar as palavras-chave:
