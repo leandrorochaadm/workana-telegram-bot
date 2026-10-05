@@ -615,17 +615,17 @@ OPENING_TEXT = (
     "Pelo que você escreveu, eu entendi que você quer o pedido no sistema na hora. "
     "É isso mesmo que você deseja? Se eu entendi algo errado, me corrige que eu ajusto."
 )
-PRICE_TEXT = "O valor é {{PRECO}}, em {{PRAZO}}. {{COBRANCA}} {{REGUA}}"
+PRICE_TEXT = "O valor é {{PRECO}}. {{PRAZO}}, contadas de quando você aprovar. {{COBRANCA}} {{REGUA}}"
 DRAFT_TEXT = f"{OPENING_TEXT}\n\n{STEPS_TEXT}\n\n{PRICE_TEXT}"
 
 
 def _draft(**overrides) -> bot.ProposalDraft:
     fields = {
         "proposal": DRAFT_TEXT,
-        "dev_hours": 50,
-        "build_hours": 20,
-        "backend_hours": 15,
-        "store_hours": 5,
+        "dev_hours": 150,
+        "build_hours": 60,
+        "backend_hours": 40,
+        "store_hours": 10,
         "screens": 4,
         "notes": "",
     }
@@ -876,22 +876,37 @@ def test_generate_proposal_raises_without_structured_output(monkeypatch) -> None
 
 
 def test_price_proposal_fills_placeholders_from_preco(rates) -> None:
-    # 50 h de dev + 4 de desenho + 8 de Fase B + 2 de wireframe = 64 h x R$ 50 = R$ 3 200
+    # 150 h de dev viram 53 com o corte; + 2 de desenho + 3 de Fase B + 1 de wireframe
+    # = 59 h x R$ 50 = R$ 2 950, arredondado para R$ 3 000
     result = bot.price_proposal(_draft(notes="design assumido."))
 
-    r = preco.calcula(horas_dev=50, telas=4)
+    r = preco.calcula(horas_dev=150, telas=4)
     assert "{{" not in result.proposal
     assert result.proposal == OPENING_TEXT + "\n\n" + (
-        "Primeiro, 10 horas no papel. Depois, 4 horas de desenho. A construção leva 20 horas. "
-        "Por trás ficam 15 horas. Depois vêm os testes, 10 horas. E no fim, 5 horas na loja. "
-        "Somando, são 64 horas de trabalho.\n\n"
-        f"O valor é R$ 3 200, em dois dias para fechar o projeto no papel e duas semanas de "
-        f"desenvolvimento. {preco.frase_da_cobranca(r)} {preco.frase_da_regua(r)}"
+        "Primeiro, 4 horas no papel. Depois, 2 horas de desenho. A construção leva 21 horas. "
+        "Por trás ficam 14 horas. Depois vêm os testes, 15 horas. E no fim, 3 horas na loja. "
+        "Somando, são 59 horas de trabalho.\n\n"
+        "O valor é R$ 3 000. É um dia para fechar o projeto no papel e duas semanas de "
+        "desenvolvimento, contadas de quando você aprovar. "
+        f"{preco.frase_da_cobranca(r)} {preco.frase_da_regua(r)}"
     )
-    assert result.price == f"R$ 3 200: entrada de {preco.brl0(r.parcelas[0].valor)} e mais 2 de {preco.brl0(r.parcelas[1].valor)}"
+    assert result.price == f"R$ 3 000: entrada de {preco.brl0(r.parcelas[0].valor)} e mais 2 de {preco.brl0(r.parcelas[1].valor)}"
     assert result.deadline == preco.prazo_texto(r.fases, r.dias_fase_1)
-    assert result.negotiation_floor == "R$ 3 200"
-    assert result.notes == "design assumido. 64 h no total, 50 de dev, 4 telas"
+    assert result.negotiation_floor == "R$ 3 000"
+    assert result.notes == "design assumido. 59 h no total, 53 de dev (150 antes do corte), 4 telas"
+
+
+@pytest.mark.parametrize(
+    ("days", "phases", "expected"),
+    [
+        (1, 2, "É um dia para fechar o projeto no papel e uma semana de desenvolvimento"),
+        (2, 6, "São dois dias para fechar o projeto no papel e cinco semanas de desenvolvimento"),
+    ],
+)
+def test_client_deadline_opens_its_sentence_with_both_units(days, phases, expected) -> None:
+    r = SimpleNamespace(dias_fase_1=days, fases=phases)
+
+    assert bot.client_deadline(r) == expected
 
 
 def test_price_proposal_drops_steps_without_hours(rates) -> None:
@@ -901,26 +916,27 @@ def test_price_proposal_drops_steps_without_hours(rates) -> None:
 
     result = bot.price_proposal(_draft(proposal=text, backend_hours=0, store_hours=0))
 
-    assert "Depois vêm os testes, 30 horas." in result.proposal
-    assert "Somando, são 64 horas de trabalho." in result.proposal
+    # The cut floors each step and the tests step takes the rounding: 53 - 21 = 32
+    assert "Depois vêm os testes, 32 horas." in result.proposal
+    assert "Somando, são 59 horas de trabalho." in result.proposal
     assert not any("horas" in item for item in result.review if item.startswith("ERRO"))
 
 
 def test_price_proposal_flags_price_below_minimum(rates) -> None:
-    result = bot.price_proposal(_draft(dev_hours=10, build_hours=4, backend_hours=3, store_hours=2))
+    result = bot.price_proposal(_draft(dev_hours=50, build_hours=20, backend_hours=15, store_hours=5))
 
     assert "abaixo do mínimo de R$ 3 000" in result.notes
 
 
 def test_price_proposal_flags_long_project(rates) -> None:
-    result = bot.price_proposal(_draft(dev_hours=400))
+    result = bot.price_proposal(_draft(dev_hours=1200))
 
     assert "projeto longo" in result.notes
 
 
 def test_price_proposal_spells_single_remaining_installment(rates) -> None:
     result = bot.price_proposal(
-        _draft(dev_hours=5, build_hours=2, backend_hours=1, store_hours=1, screens=1)
+        _draft(dev_hours=50, build_hours=20, backend_hours=15, store_hours=5, screens=1)
     )
 
     assert "e mais uma de R$" in result.proposal
@@ -943,7 +959,11 @@ def test_price_proposal_without_estimate_leaves_price_open(rates) -> None:
         {"backend_hours": 0},
         {"build_hours": 0},
         {"store_hours": -1},
-        {"build_hours": 30},
+        {"build_hours": 100},
+        # Steps the cut would floor to zero
+        {"store_hours": 2},
+        {"build_hours": 2},
+        {"build_hours": 60, "backend_hours": 40, "store_hours": 48},
         {"dev_hours": 0},
         {"screens": 0},
     ],
@@ -951,6 +971,11 @@ def test_price_proposal_without_estimate_leaves_price_open(rates) -> None:
 def test_price_proposal_rejects_inconsistent_draft(rates, overrides) -> None:
     with pytest.raises(bot.ProposalError):
         bot.price_proposal(_draft(**overrides))
+
+
+def test_price_proposal_names_step_the_cut_would_zero(rates) -> None:
+    with pytest.raises(bot.ProposalError, match=r"zera no corte: Publicar na loja \(2 h\)"):
+        bot.price_proposal(_draft(store_hours=2))
 
 
 def test_review_proposal_lists_errors_before_alerts() -> None:

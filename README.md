@@ -67,12 +67,13 @@ O token expira (no máximo em 1 ano). Ao renovar, rode `npx wrangler secret put 
 ## Propostas com o Claude
 
 Para cada vaga que bate com as palavras-chave, o bot abre a página, lê a descrição e pede ao
-Claude (`claude-opus-5-5`) uma proposta. Chegam duas mensagens: uma com título, link, preço,
+Claude (`claude-sonnet-5-5`) uma proposta. Chegam duas mensagens: uma com título, link, preço,
 prazo, piso de negociação e observações; outra só com o texto da proposta, para copiar.
 
 - Antes da proposta, o Haiku (`claude-haiku-4-5-20251001`) faz uma triagem e responde só sim ou
   não: a vaga precisa ser um app mobile ou um sistema web com telas. Landing page, site, loja
-  pronta, só design, bot, automação etc. são ignoradas: não chegam no Telegram, não seguem para
+  pronta, só design, bot, automação etc. são ignoradas, assim como terminar ou dar manutenção
+  em app ou sistema web que já existe e não foi feito em Flutter: não chegam no Telegram, não seguem para
   a proposta e não gastam o limite de propostas da execução. A vaga rejeitada vai para o
   `seen.json` e para o `rejected.json` (título, link e data, para ajustar os critérios) e nunca
   é tentada de novo. Se a triagem falhar, a proposta é gerada mesmo assim. Os critérios
@@ -93,7 +94,9 @@ os marcadores `{{PRECO}}`, `{{PRAZO}}`, `{{COBRANCA}}` e `{{REGUA}}`, mais um ma
 por etapa (`{{HORAS_PAPEL}}`, `{{HORAS_DESENHO}}`, `{{HORAS_CONSTRUCAO}}`, `{{HORAS_BASTIDORES}}`,
 `{{HORAS_TESTES}}`, `{{HORAS_LOJA}}`) e o `{{HORAS_TOTAL}}`. O bot calcula preço, prazo, parcelas,
 piso e as horas do papel e do desenho com o `preco.py` (copiado da skill `proposta-freela`); os
-testes ficam com o que sobra das horas de desenvolvimento, então as etapas sempre somam o total.
+testes ficam com o que sobra das horas de desenvolvimento. O Claude estima horas cheias, e o
+`preco.py` aplica o corte de tempo da skill (`CORTE_DE_TEMPO`) em cada etapa, jogando a sobra do
+arredondamento nos testes, então as etapas sempre somam o total.
 Etapa com zero horas sai do texto junto com o marcador. Proposta com marcador faltando ou sobrando
 é tratada como falha e tentada de novo.
 

@@ -11,7 +11,10 @@ Não estima horas nem telas: isso é julgamento sobre a vaga e entra como argume
 Uso:
     uv run scripts/preco.py --horas 90 --telas 8
     uv run scripts/preco.py --horas 90 --telas 8 --orcamento-cliente 9000
-    uv run scripts/preco.py --horas 90 --telas 8 --fator-estimativa 1.3
+    uv run scripts/preco.py --horas 90 --telas 8 --etapas 40,30,12,8
+
+--horas recebe a estimativa crua de dev: o corte de tempo (CORTE_DE_TEMPO) é
+aplicado aqui dentro.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import math
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------
-# Números que vencem — fonte única da verdade (última conferência: ago/2026)
+# Números que vencem — fonte única da verdade (última conferência: out/2026)
 # --------------------------------------------------------------------------
 
 # Private in the bot's public repo: the caller sets both from secrets before calcula()
@@ -30,9 +33,14 @@ GORDURA = 0.0  # sobre a estimativa; hoje sem gordura (decisão de ago/2026)
 MINIMO_PROJETO = 0.0  # corte de triagem
 SIMPLES = 0.06  # Anexo III por Fator R, primeira faixa
 
-# Levantamento (Fase B), em horas: faixa única, ponto médio 8 h (conferência: set/2026)
+# Corte de tempo (decisão de out/2026): todo bloco de horas entra na conta com 35%
+# do que levava antes — dev, Fase B, wireframe e desenho das telas.
+CORTE_DE_TEMPO = 0.35
+
+# Levantamento (Fase B), em horas: faixa única. A base de 6 a 10 h passa pelo corte e
+# vira 2 a 4 h, ponto médio 3 h.
 #
-# As 8 h cobrem as duas fases de requisitos (escopo de pré-venda e requisitos
+# As 3 h cobrem as duas fases de requisitos (escopo de pré-venda e requisitos
 # detalhados), a análise técnica e o handoff para o desenvolvimento. **Não cobrem o
 # desenho das telas**: o wireframe tem linha própria na conta, sai por
 # HORAS_WIREFRAME_POR_TELA e é entregue na primeira semana de desenvolvimento.
@@ -40,18 +48,20 @@ SIMPLES = 0.06  # Anexo III por Fator R, primeira faixa
 # A faixa não olha o número de telas: o que a Fase B produz é o entendimento do
 # negócio e das regras, e isso não cresce na proporção das telas — o que cresce com
 # elas é o desenho, que agora é bloco separado.
-LEVANTAMENTO_FAIXA = (6, 10)
+LEVANTAMENTO_FAIXA_BASE = (6, 10)
+LEVANTAMENTO_FAIXA = tuple(round(h * CORTE_DE_TEMPO) for h in LEVANTAMENTO_FAIXA_BASE)
 
 # Desenho das telas, em horas por tela: o mock em preto e branco que o CLIENTE
 # recebe para ver o básico de cada tela. Fica FORA da Fase B e dentro do
 # desenvolvimento: é entrega da primeira semana de dev, não dos dias iniciais.
-HORAS_DESENHO_POR_TELA = 1
+# Uma hora por tela antes do corte; o total do bloco arredonda para cima.
+HORAS_DESENHO_POR_TELA = 1 * CORTE_DE_TEMPO
 
 # Wireframe de planejamento, em horas por tela: o rascunho INTERNO, que ninguém
 # além do usuário vê. Não é entregável, e por isso não aparece no texto da
 # proposta — mas é trabalho, acontece dentro da fase 1 e por isso entra na conta e
-# no tempo dela. Meia hora por tela, arredondada para cima no total do bloco.
-HORAS_WIREFRAME_POR_TELA = 0.5
+# no tempo dela. Meia hora por tela antes do corte, arredondada para cima no total do bloco.
+HORAS_WIREFRAME_POR_TELA = 0.5 * CORTE_DE_TEMPO
 
 # --------------------------------------------------------------------------
 # A régua: uma parcela por fase
@@ -59,7 +69,7 @@ HORAS_WIREFRAME_POR_TELA = 0.5
 # É a única régua. A fase 1 é o levantamento (a Fase B) e dura DIAS_FASE_B dias
 # úteis; as demais são semanas de desenvolvimento de esforço igual, e a última
 # termina com o app publicado. As entregas de desenvolvimento caem na sexta-feira,
-# no fim da tarde; a da fase 1, no fim do segundo dia útil.
+# no fim da tarde; a da fase 1, no fim do último dia dela (ver entrega_da_fase_1).
 #
 # A entrada é max(ENTRADA_MINIMA, 1/fases) e o resto se divide por igual. Até
 # 1/ENTRADA_MINIMA fases a fatia de uma fase é a maior das duas e as parcelas
@@ -69,7 +79,7 @@ HORAS_WIREFRAME_POR_TELA = 0.5
 
 HORAS_POR_SEMANA = 30.0  # horas disponíveis por semana (conferência: ago/2026)
 HORAS_POR_DIA = HORAS_POR_SEMANA / 5  # dia útil de trabalho, para o prazo da Fase B
-DIAS_FASE_B = 2  # a fase 1 dura dois dias úteis, não uma semana
+DIAS_FASE_B = 1  # a fase 1 dura um dia útil, não uma semana; decisão de prazo, fora do corte
 ENTRADA_MINIMA = 0.20  # abaixo de 1/ENTRADA_MINIMA semanas a fatia de uma semana é maior e manda
 PASSO_PARCELA = 10.0  # as parcelas saem redondas; a sobra vai toda para a entrada
 SEMANAS_PROJETO_LONGO = 12
@@ -78,12 +88,6 @@ ORDINAL_MASCULINO = {
     1: "primeiro", 2: "segundo", 3: "terceiro", 4: "quarto", 5: "quinto",
     6: "sexto", 7: "sétimo", 8: "oitavo", 9: "nono", 10: "décimo",
 }
-
-# Fator de estimativa: correção do histórico real, medida por
-# `scripts/produtividade.py calibrar`. 1.0 = estimativa crua, sem calibragem.
-# Multiplica só as horas de desenvolvimento: a Fase B tem faixa própria, e se ela
-# estiver curta o conserto é subir LEVANTAMENTO_*, não aplicar fator aqui.
-FATOR_ESTIMATIVA_PADRAO = 1.0
 
 # Fração da gordura que sobrevive no piso de negociação. 0.0 = o piso é a
 # estimativa crua: cortar mais que a gordura é trabalhar de graça no imprevisto
@@ -102,10 +106,32 @@ ENTREGA_DEV = "bloco de desenvolvimento (preencher no analise.md)"
 ENTREGA_FINAL = "último bloco e a publicação nas lojas"
 ENTREGA_FINAL_COM_DESENHO = "o desenho das telas, o desenvolvimento e a publicação nas lojas"
 
+# As seis etapas do movimento 4 da proposta, na ordem canônica. As duas primeiras
+# saem da conta (fase 1 e desenho); as quatro de dev entram cheias em --etapas.
+ETAPAS = (
+    "Fechar o projeto no papel",
+    "Desenhar as telas",
+    "Construir o app",
+    "O que roda por trás das telas",
+    "Testes e ajustes",
+    "Publicar na loja",
+)
+ETAPAS_DE_DEV = ETAPAS[2:]
+ETAPA_DA_SOBRA = ETAPAS_DE_DEV.index("Testes e ajustes")
+
 
 # --------------------------------------------------------------------------
 # Cálculo
 # --------------------------------------------------------------------------
+
+
+def horas_inteiras(horas: float) -> int:
+    """Arredonda horas para cima, sem cair em ruído de ponto flutuante.
+
+    O corte gera contas como 0,35 × 60, que podem sair 21,000000000000004 e virar 22 h
+    num `ceil` direto.
+    """
+    return math.ceil(round(horas, 6))
 
 
 def entrega_da_fase_1(dias: int) -> str:
@@ -142,29 +168,41 @@ def horas_desenho(telas: int) -> int:
     telas, e é por isso que ele tem linha própria: somado à Fase B, ele fazia os
     dias iniciais crescerem sem que o entendimento do negócio crescesse junto.
     """
-    return telas * HORAS_DESENHO_POR_TELA
+    return horas_inteiras(telas * HORAS_DESENHO_POR_TELA)
 
 
 def horas_wireframe(telas: int) -> int:
     """Horas do rascunho interno de planejamento. Dentro da fase 1.
 
     Arredonda o total para cima porque as horas de fase são inteiras: 9 telas dão
-    4,5 h, que viram 5. Não confundir com `horas_desenho` — este bloco não é
+    1,575 h, que viram 2. Não confundir com `horas_desenho` — este bloco não é
     entregável e nunca é citado ao cliente.
     """
-    return math.ceil(telas * HORAS_WIREFRAME_POR_TELA)
+    return horas_inteiras(telas * HORAS_WIREFRAME_POR_TELA)
 
 
 def dias_da_fase_1(horas_fase_1: int) -> int:
     """Quantos dias úteis a fase 1 ocupa. Nunca menos que DIAS_FASE_B.
 
     A fase 1 deixou de ter duração fixa quando o wireframe de planejamento entrou
-    nela: 8 h de levantamento cabem em dois dias, mas 8 h mais meia hora por tela
-    não cabem em app grande. O prazo sai das horas para não prometer dois dias onde
-    são três — e o piso existe porque levantamento não se faz em meio dia, mesmo em
-    app de duas telas.
+    nela: 3 h de levantamento cabem em um dia, mas 3 h mais o wireframe de 20 telas
+    não cabem. O prazo sai das horas para não prometer um dia onde são dois — e o
+    piso existe para a fase 1 nunca sair com menos que DIAS_FASE_B, mesmo em app de
+    duas telas.
     """
     return max(DIAS_FASE_B, math.ceil(horas_fase_1 / HORAS_POR_DIA))
+
+
+def horas_das_etapas_de_dev(etapas_cheias: list[int], horas_dev: int) -> list[int]:
+    """Aplica o corte em cada etapa de dev e fecha a soma com as horas de dev da conta.
+
+    Cada etapa desce para o inteiro abaixo; a sobra do arredondamento vai inteira para
+    "Testes e ajustes". Como as horas de dev arredondam para cima, a sobra nunca é
+    negativa.
+    """
+    cortadas = [math.floor(round(h * CORTE_DE_TEMPO, 6)) for h in etapas_cheias]
+    cortadas[ETAPA_DA_SOBRA] += horas_dev - sum(cortadas)
+    return cortadas
 
 
 def arredonda_para_cima(valor: float) -> float:
@@ -181,18 +219,27 @@ def numero_de_fases(horas_execucao: int) -> int:
     de HORAS_POR_SEMANA e arredonda para cima: sobra folga em cada fase em vez de
     faltar, e é essa folga que faz a entrega de sexta-feira sobreviver à semana em
     que algo dá errado. A fase 1 não é uma semana: são DIAS_FASE_B dias úteis, e é
-    por isso que o prazo do projeto se escreve "2 dias + N semanas".
+    por isso que o prazo do projeto se escreve "1 dia + N semanas".
     """
     return 1 + math.ceil(horas_execucao / HORAS_POR_SEMANA)
+
+
+def dias(n: int) -> str:
+    """'1 dia', '2 dias'."""
+    return f"{n} dia" if n == 1 else f"{n} dias"
+
+
+def dias_uteis(dias: int) -> str:
+    """'1 dia útil', '2 dias úteis'."""
+    return f"{dias} dia útil" if dias == 1 else f"{dias} dias úteis"
 
 
 def prazo_texto(fases: int, dias_fase_1: int = DIAS_FASE_B) -> str:
     """O prazo como ele vai no analise.md: os dias da fase 1 + as semanas de dev."""
     semanas = fases - 1
     unidade_semana = "semana" if semanas == 1 else "semanas"
-    unidade_dia = "dia" if dias_fase_1 == 1 else "dias"
     return (
-        f"{dias_fase_1} {unidade_dia} de levantamento + {semanas} {unidade_semana} "
+        f"{dias(dias_fase_1)} de levantamento + {semanas} {unidade_semana} "
         "de desenvolvimento"
     )
 
@@ -227,7 +274,7 @@ def regua_das_fases(fases: int, fatia_do_levantamento: float = 0.0) -> tuple[flo
        recebido nunca atrasa em relação ao entregue depois da entrada, e sem ele um
        projeto de levantamento pesado e pouco desenvolvimento continuaria descoberto
        mesmo já tendo cobrado a entrada. Na prática ele quase nunca é o maior dos
-       três — a Fase B são 8 h contra dezenas de desenvolvimento.
+       três — a Fase B são 3 h contra dezenas de desenvolvimento.
     2. **O resto se divide por igual**, porque o esforço das semanas de
        desenvolvimento é igual. Uma semana de dev vale um pouco mais que a parcela
        que a acompanha, e quem cobria essa diferença era a folga da entrada; desde
@@ -312,7 +359,7 @@ class Fase:
 class Resultado:
     horas_dev: int
     horas_dev_informado: int
-    fator_estimativa: float
+    corte_de_tempo: float
     telas: int
     fases: int
     cronograma: list[Fase]
@@ -336,6 +383,7 @@ class Resultado:
     piso_liquido: float
     piso_hora_efetiva: float
     orcamento_cliente: float | None
+    etapas: list[tuple[str, int]] | None = None
     semanas_manuais: bool = False
     fase_b_manual: bool = False
     alertas: list[str] = field(default_factory=list)
@@ -393,8 +441,7 @@ def monta_cronograma(
         entregue = acumulado / total if total else 0.0
         recebido = recebido_antes_da_fase(regua, fase)
         if fase == 1:
-            unidade = "dia" if dias_fase_1 == 1 else "dias"
-            entrega, duracao = ENTREGA_FASE_B, f"{dias_fase_1} {unidade}"
+            entrega, duracao = ENTREGA_FASE_B, dias(dias_fase_1)
         else:
             duracao = "1 semana"
             if fase == 2 and fase == len(horas):
@@ -446,11 +493,13 @@ def checagens(r: Resultado) -> list[str]:
             "Recomende não se candidatar — o overhead de proposta, alinhamento e revisão come a margem."
         )
 
-    fatia_do_levantamento = r.horas_fase_b / r.horas_total if r.horas_total else 0.0
+    # Mesma fatia que `calcula` passa à régua: a fase 1 inteira, levantamento mais
+    # wireframe. Medir só a Fase B deixava a entrada subir sem o aviso que explica.
+    fatia_do_levantamento = r.horas_fase_1 / r.horas_total if r.horas_total else 0.0
     if fatia_do_levantamento > max(ENTRADA_MINIMA, 1 / r.fases) + 1e-9:
         if r.semanas_manuais:
             causa = (
-                "A causa aqui é o calendário esticado à mão com --semanas: ele encolhe a fase "
+                "A causa aqui é o calendário esticado à mão com --fases: ele encolhe a fase "
                 "de desenvolvimento sem encolher a Fase B."
             )
         elif r.fase_b_manual:
@@ -460,7 +509,7 @@ def checagens(r: Resultado) -> list[str]:
             )
         else:
             causa = (
-                "Confira as horas: com a Fase B em 8 h, ela só passa desse peso quando a "
+                "Confira as horas: com a Fase B no ponto médio da faixa, ela só passa desse peso quando a "
                 "estimativa de dev está curta demais."
             )
         avisos.append(
@@ -479,17 +528,17 @@ def checagens(r: Resultado) -> list[str]:
 
     if r.dias_fase_1 > DIAS_FASE_B:
         avisos.append(
-            f"A fase 1 ficou com {r.dias_fase_1} dias úteis, não {DIAS_FASE_B}: são "
+            f"A fase 1 ficou com {dias_uteis(r.dias_fase_1)}, não {DIAS_FASE_B}: são "
             f"{r.horas_fase_b} h de levantamento mais {r.horas_wireframe} h de wireframe das "
             f"{r.telas} telas, e isso não cabe em {DIAS_FASE_B * HORAS_POR_DIA:.0f} h. **O prazo "
-            "da proposta e do contrato usa esse número**, não os dois dias de sempre."
+            f"da proposta e do contrato usa esse número**, não o(s) {dias_uteis(DIAS_FASE_B)} de sempre."
         )
 
     horas_dev_por_fase = max(s.horas for s in r.cronograma[1:])
     if horas_dev_por_fase > HORAS_POR_SEMANA:
         avisos.append(
             f"Fase de desenvolvimento com {horas_dev_por_fase} h, acima das "
-            f"{HORAS_POR_SEMANA:.0f} h disponíveis na semana. Com --semanas informado "
+            f"{HORAS_POR_SEMANA:.0f} h disponíveis na semana. Com --fases informado "
             "à mão você comprimiu o calendário: ou sobem as semanas, ou a entrega de sexta não fecha."
         )
 
@@ -536,8 +585,7 @@ def checagens(r: Resultado) -> list[str]:
             f"Última fase descoberta por {brl0(risco_final)}, ou {pct1(risco_final / r.preco)} do "
             "projeto — é a parcela final, e é deliberado: ela fica presa ao aceite com o app "
             "publicado. Se o cliente sumir nessa semana, a Cláusula 6.6 do contrato segura o "
-            "código e as chaves das lojas, então ele não leva o app. Fora ela e a fase 1, todas "
-            "as fases estão pagas antes de começar."
+            "código e as chaves das lojas, então ele não leva o app."
         )
 
     # O limiar conta SEMANAS DE DESENVOLVIMENTO, que é o que a constante nomeia.
@@ -579,19 +627,17 @@ def calcula(
     orcamento_cliente: float | None = None,
     fases_manual: int | None = None,
     horas_fase_b_manual: int | None = None,
-    fator_estimativa: float = FATOR_ESTIMATIVA_PADRAO,
+    etapas_cheias: list[int] | None = None,
 ) -> Resultado:
-    alertas: list[str] = []
-
-    horas_dev_informado = horas_dev
-    if fator_estimativa != 1.0:
-        horas_dev = math.ceil(horas_dev * fator_estimativa)
-        alertas.append(
-            f"Fator de estimativa {fator_estimativa} aplicado: {horas_dev_informado} h "
-            f"estimadas viraram {horas_dev} h de desenvolvimento na conta. Origem do fator: "
-            "`produtividade.py calibrar`. A Fase B, o wireframe e o desenho das telas não "
-            "recebem fator."
+    if etapas_cheias is not None and (
+        len(etapas_cheias) != len(ETAPAS_DE_DEV) or sum(etapas_cheias) != horas_dev
+    ):
+        raise ValueError(
+            f"etapas={etapas_cheias}: são {len(ETAPAS_DE_DEV)} etapas de dev "
+            f"({', '.join(ETAPAS_DE_DEV)}) e a soma delas tem de ser {horas_dev} h, o --horas."
         )
+    horas_dev_informado = horas_dev
+    horas_dev = horas_inteiras(horas_dev * CORTE_DE_TEMPO)
 
     h_desenho = horas_desenho(telas)
     h_wireframe = horas_wireframe(telas)
@@ -618,7 +664,7 @@ def calcula(
         raise ValueError(
             f"fases={fases} para {horas_execucao} h de desenvolvimento: sobra fase sem hora "
             "nenhuma, e entrega vazia não é entrega. O calendário derivado das horas nunca "
-            "faz isso — reduza --semanas."
+            "faz isso — reduza --fases."
         )
     fatia_do_levantamento = h_fase_1 / horas_total if horas_total else 0.0
     regua = regua_das_fases(fases, fatia_do_levantamento)
@@ -664,7 +710,7 @@ def calcula(
     resultado = Resultado(
         horas_dev=horas_dev,
         horas_dev_informado=horas_dev_informado,
-        fator_estimativa=fator_estimativa,
+        corte_de_tempo=CORTE_DE_TEMPO,
         telas=telas,
         fases=fases,
         cronograma=cronograma,
@@ -690,11 +736,11 @@ def calcula(
         orcamento_cliente=orcamento_cliente,
         semanas_manuais=fases_manual is not None,
         fase_b_manual=horas_fase_b_manual is not None,
-        alertas=alertas,
     )
-    # Os dois alertas de cima nascem no meio da conta, com estado que não sobrevive
-    # até aqui. O resto é conferência sobre o resultado pronto, e mora em checagens().
-    resultado.alertas.extend(checagens(resultado))
+    if etapas_cheias is not None:
+        horas = [h_fase_1, h_desenho] + horas_das_etapas_de_dev(etapas_cheias, horas_dev)
+        resultado.etapas = list(zip(ETAPAS, horas))
+    resultado.alertas = checagens(resultado)
     return resultado
 
 
@@ -727,12 +773,8 @@ def pct_auto(valor: float) -> str:
     return pct(valor) if abs(valor * 100 - round(valor * 100)) < 0.05 else pct1(valor)
 
 
-def num1(valor: float) -> str:
-    return f"{valor:.1f}".replace(".", ",")
-
-
 def num2(valor: float) -> str:
-    """Duas casas: o fator de estimativa é 1,38, não 1,4."""
+    """Duas casas: o corte de tempo é 0,35, não 0,4."""
     return f"{valor:.2f}".replace(".", ",")
 
 
@@ -844,26 +886,26 @@ def markdown(r: Resultado) -> str:
     add("| Bloco | Horas |")
     add("|---|---|")
     rotulo_dev = "Desenvolvimento (estimativa)"
-    if r.fator_estimativa != 1.0:
-        rotulo_dev += f" — {r.horas_dev_informado} h × fator {num2(r.fator_estimativa)} do histórico"
+    if r.corte_de_tempo != 1.0:
+        rotulo_dev += f" — {r.horas_dev_informado} h × corte {num2(r.corte_de_tempo)}"
     add(f"| {rotulo_dev} | {r.horas_dev} h |")
     add(
         f"| Desenho das telas (o mock que o cliente recebe) — {r.telas} × "
-        f"{HORAS_DESENHO_POR_TELA} h, na 1ª semana de dev | {r.horas_desenho} h |"
+        f"{num2(HORAS_DESENHO_POR_TELA)} h, na 1ª semana de dev | {r.horas_desenho} h |"
     )
     add(
         f"| Levantamento (Fase B) — requisitos, análise técnica e handoff | {r.horas_fase_b} h |"
     )
     add(
         f"| Wireframe de planejamento (interno, não entregável) — {r.telas} × "
-        f"{num1(HORAS_WIREFRAME_POR_TELA)} h, dentro da fase 1 | {r.horas_wireframe} h |"
+        f"{num2(HORAS_WIREFRAME_POR_TELA)} h, dentro da fase 1 | {r.horas_wireframe} h |"
     )
     add(f"| **Total** | **{r.horas_total} h** |")
     add("")
     add(
         f"Faixa de referência da Fase B: {r.faixa_fase_b[0]} a {r.faixa_fase_b[1]} h, independente "
         f"do número de telas. Com o wireframe de planejamento, a **fase 1 fecha em "
-        f"{r.horas_fase_1} h e {r.dias_fase_1} dias úteis**. **O desenho que o cliente recebe não "
+        f"{r.horas_fase_1} h e {dias_uteis(r.dias_fase_1)}**. **O desenho que o cliente recebe não "
         "está aí dentro**: ele é bloco de desenvolvimento e é entregue na primeira semana de dev."
     )
     add("")
@@ -871,6 +913,27 @@ def markdown(r: Resultado) -> str:
     if GORDURA:
         add(f"- Gordura de {pct(GORDURA)} = **{brl(r.com_gordura)}**")
     add(f"- Arredondado para cima: **{brl0(r.preco)}**")
+    add("")
+
+    add("## Etapas da proposta")
+    add("")
+    if r.etapas is None:
+        add(
+            "Rode de novo com `--etapas` (as horas cheias de construir o app, o que roda por "
+            "trás das telas, testes e ajustes e publicar na loja) para as horas por etapa que "
+            "vão ao texto."
+        )
+    else:
+        add("| Etapa | Horas |")
+        add("|---|---|")
+        for nome, horas in r.etapas:
+            add(f"| {nome} | {horas} h |")
+        add(f"| **Total** | **{sum(h for _, h in r.etapas)} h** |")
+        add("")
+        add(
+            f"As etapas de dev entraram cheias e saíram × {num2(r.corte_de_tempo)}, cada uma "
+            "arredondada para baixo; a sobra foi para testes e ajustes. Etapa com zero sai do texto."
+        )
     add("")
 
     add("## As fases")
@@ -889,7 +952,7 @@ def markdown(r: Resultado) -> str:
     abertura = (
         f"**{r.fases} fases: {prazo_texto(r.fases, r.dias_fase_1)}.** A fase 1 é o levantamento "
         "— requisitos, análise técnica, handoff e o wireframe de planejamento —, dura "
-        f"{r.dias_fase_1} dias úteis e entrega {entrega_da_fase_1(r.dias_fase_1)}. "
+        f"{dias_uteis(r.dias_fase_1)} e entrega {entrega_da_fase_1(r.dias_fase_1)}. "
     )
     if len(horas_dev_fase) == 1:
         # Uma fase de dev só: falar em "a primeira delas" e "a última" prometeria
@@ -915,8 +978,9 @@ def markdown(r: Resultado) -> str:
         "O esforço das fases de desenvolvimento é igual de propósito: é isso que impede uma "
         "entrega de valer mais do que a parcela dela. **As horas não se remanejam entre fases** "
         "— o que não coube na semana entra na seguinte, e o conteúdo de cada uma é que se ajusta. "
-        "Preencha a coluna do que fica pronto no analise.md com o conteúdo real; na proposta, diga "
-        "quanto tempo é cada fase e o que ele recebe em cada uma, sem citar as horas da fase: as horas vão ao texto por etapa do trabalho, e a soma delas é o Total acima."
+        "Preencha a coluna do que fica pronto no analise.md com o conteúdo real; na proposta vão só "
+        "os dias da fase 1 e o total de semanas, e o que ele recebe em cada fase fica para a "
+        "conversa. As horas vão ao texto por etapa do trabalho, e a soma delas é o Total acima."
     )
     add("")
     add(
@@ -1032,7 +1096,7 @@ def markdown(r: Resultado) -> str:
         "Abaixo disso, corte **escopo de produto** (tela, funcionalidade, integração). "
         "O levantamento não é item cortável: é ele que a **entrada paga**, é a aprovação dele "
         "que abre a assinatura do contrato, e é ela que faz o prazo começar a correr. Cortar tela corta o "
-        "desenho dela junto, uma hora por tela. **Cortar escopo encurta o calendário**, então "
+        f"desenho dela junto, {num2(HORAS_DESENHO_POR_TELA)} h por tela. **Cortar escopo encurta o calendário**, então "
         "recalcule: menos semanas é menos parcelas."
     )
     add("")
@@ -1056,13 +1120,13 @@ def main() -> None:
     p.add_argument("--telas", type=int, required=True, help="número de telas do app")
     p.add_argument("--orcamento-cliente", type=float, default=None, help="orçamento informado pelo cliente, se houver")
     p.add_argument(
-        "--semanas",
+        "--fases",
         type=int,
         default=None,
         help=(
-            "número de fases; se omitido, é 1 (o levantamento, de 2 dias) + as semanas de "
-            "desenvolvimento arredondadas para cima. Informe à mão só para esticar o calendário, "
-            "nunca para comprimir"
+            "número de fases, contando a fase 1 (o levantamento): 8 fases são 7 semanas de "
+            "desenvolvimento. Se omitido, é 1 + as semanas de desenvolvimento arredondadas para "
+            "cima. Informe à mão só para esticar o calendário, nunca para comprimir"
         ),
     )
     p.add_argument(
@@ -1072,31 +1136,42 @@ def main() -> None:
         help=f"sobrescreve as horas da Fase B (padrão: ponto médio de {LEVANTAMENTO_FAIXA})",
     )
     p.add_argument(
-        "--fator-estimativa",
-        type=float,
-        default=FATOR_ESTIMATIVA_PADRAO,
-        help="correção das horas de dev pelo histórico real; sai de `produtividade.py calibrar`",
+        "--etapas",
+        default=None,
+        help=(
+            "horas cheias das 4 etapas de dev, separadas por vírgula, na ordem: construir o "
+            "app, o que roda por trás das telas, testes e ajustes, publicar na loja. A soma "
+            "tem de ser igual a --horas"
+        ),
     )
     args = p.parse_args()
 
+    etapas_cheias = None
+    if args.etapas is not None:
+        try:
+            etapas_cheias = [int(x) for x in args.etapas.split(",")]
+        except ValueError:
+            p.error("--etapas precisa de 4 números inteiros separados por vírgula, como 40,30,12,8")
+        if len(etapas_cheias) != len(ETAPAS_DE_DEV) or min(etapas_cheias) < 0:
+            p.error("--etapas precisa de 4 números inteiros, nenhum negativo, como 40,30,12,8")
+        if sum(etapas_cheias) != args.horas:
+            p.error(f"--etapas soma {sum(etapas_cheias)} h e --horas é {args.horas} h: as duas têm de bater")
     if args.horas <= 0 or args.telas <= 0:
         p.error("--horas e --telas precisam ser maiores que zero")
-    if args.semanas is not None and args.semanas < 2:
-        p.error("--semanas precisa ser 2 ou mais: a fase 1 é o levantamento e o desenvolvimento vem depois")
+    if args.fases is not None and args.fases < 2:
+        p.error("--fases precisa ser 2 ou mais: a fase 1 é o levantamento e o desenvolvimento vem depois")
     if args.horas_levantamento is not None and args.horas_levantamento <= 0:
         p.error("--horas-levantamento precisa ser maior que zero: a Fase B acontece em todo projeto")
     if args.orcamento_cliente is not None and args.orcamento_cliente <= 0:
         p.error("--orcamento-cliente precisa ser maior que zero")
-    if args.fator_estimativa <= 0:
-        p.error("--fator-estimativa precisa ser maior que zero")
 
     r = calcula(
         horas_dev=args.horas,
         telas=args.telas,
         orcamento_cliente=args.orcamento_cliente,
-        fases_manual=args.semanas,
+        fases_manual=args.fases,
         horas_fase_b_manual=args.horas_levantamento,
-        fator_estimativa=args.fator_estimativa,
+        etapas_cheias=etapas_cheias,
     )
     print(markdown(r))
 

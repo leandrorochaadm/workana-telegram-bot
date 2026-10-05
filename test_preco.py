@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pathlib
 import unittest
+from unittest import mock
 
 import preco
 from preco import (
@@ -19,7 +20,6 @@ from preco import (
     GORDURA,
     PASSO_PARCELA,
     arredonda_para_cima,
-    calcula,
     eventos_das_fases,
     numero_de_fases,
     horas_das_fases,
@@ -29,9 +29,15 @@ from preco import (
 )
 
 
+def calcula(**kwargs):
+    """Dev hours go in untouched: the tests check the rules, not today's time cut."""
+    with mock.patch.object(preco, "CORTE_DE_TEMPO", 1.0):
+        return preco.calcula(**kwargs)
+
+
 # Fictional rates: the real ones are private and come from secrets
 TEST_HOURLY_RATE = 50.0
-TEST_MIN_PROJECT = 3_000.0
+TEST_MIN_PROJECT = 2_000.0
 _real_rates: tuple[float, float] = (0.0, 0.0)
 
 
@@ -69,21 +75,21 @@ class TestArredondamento(unittest.TestCase):
 
 
 class TestLevantamento(unittest.TestCase):
-    """8 h em 2 dias, e só requisitos, análise técnica e handoff: o desenho saiu daqui."""
+    """3 h em 1 dia, e só requisitos, análise técnica e handoff: o desenho saiu daqui."""
 
     def test_ponto_medio_da_faixa(self):
         horas, faixa = horas_levantamento()
-        self.assertEqual(faixa, (6, 10))
-        self.assertEqual(horas, 8)
+        self.assertEqual(faixa, (2, 4))
+        self.assertEqual(horas, 3)
 
     def test_nao_depende_do_numero_de_telas(self):
         # Regressão: a Fase B saía do número de telas porque incluía os wireframes.
         # Com o desenho fora dela, o que sobrou é conversa de negócio e não escala
         # com tela nenhuma.
         for telas in (3, 8, 11, 25):
-            self.assertEqual(calcula(horas_dev=90, telas=telas).horas_fase_b, 8)
+            self.assertEqual(calcula(horas_dev=90, telas=telas).horas_fase_b, 3)
 
-    def test_cabe_nos_dois_dias_uteis(self):
+    def test_cabe_no_dia_util(self):
         horas, faixa = horas_levantamento()
         self.assertLessEqual(faixa[1], preco.DIAS_FASE_B * preco.HORAS_POR_DIA)
         self.assertLessEqual(horas, preco.DIAS_FASE_B * preco.HORAS_POR_DIA)
@@ -92,49 +98,49 @@ class TestLevantamento(unittest.TestCase):
 class TestDesenhoEWireframe(unittest.TestCase):
     """Dois blocos distintos: o mock que o cliente recebe e o rascunho interno.
 
-    O desenho (1 h por tela) é entregue e mora no desenvolvimento; o wireframe de
-    planejamento (0,5 h por tela) é interno e mora na fase 1, junto do levantamento.
+    O desenho (0,35 h por tela) é entregue e mora no desenvolvimento; o wireframe de
+    planejamento (0,175 h por tela) é interno e mora na fase 1, junto do levantamento.
     """
 
-    def test_uma_hora_de_desenho_e_meia_de_wireframe_por_tela(self):
+    def test_desenho_e_wireframe_por_tela_com_o_corte(self):
         r = calcula(horas_dev=90, telas=8)
-        self.assertEqual(r.horas_desenho, 8)
-        self.assertEqual(r.horas_wireframe, 4)
-        self.assertEqual(r.horas_execucao, 98)  # dev + desenho
-        self.assertEqual(r.horas_fase_1, 12)  # Fase B + wireframe
-        self.assertEqual(r.horas_total, 98 + 12)
+        self.assertEqual(r.horas_desenho, 3)  # 8 × 0,35 = 2,8 → 3
+        self.assertEqual(r.horas_wireframe, 2)  # 8 × 0,175 = 1,4 → 2
+        self.assertEqual(r.horas_execucao, 93)  # dev + desenho
+        self.assertEqual(r.horas_fase_1, 5)  # Fase B + wireframe
+        self.assertEqual(r.horas_total, 93 + 5)
 
     def test_wireframe_arredonda_o_bloco_para_cima(self):
-        # 9 telas dão 4,5 h, e hora de fase é inteira.
-        self.assertEqual(preco.horas_wireframe(9), 5)
-        self.assertEqual(preco.horas_wireframe(8), 4)
+        # 6 telas dão 1,05 h, e hora de fase é inteira.
+        self.assertEqual(preco.horas_wireframe(6), 2)
+        self.assertEqual(preco.horas_wireframe(5), 1)
 
     def test_a_fase_1_cresce_em_dias_quando_o_wireframe_nao_cabe(self):
-        # 8 h de Fase B + 0,5 h × telas contra 6 h por dia útil.
-        cabe = calcula(horas_dev=90, telas=8)  # 12 h → 2 dias
-        estoura = calcula(horas_dev=90, telas=16)  # 16 h → 3 dias
-        self.assertEqual(cabe.dias_fase_1, 2)
-        self.assertEqual(estoura.dias_fase_1, 3)
+        # 3 h de Fase B + 0,175 h × telas contra 6 h por dia útil.
+        cabe = calcula(horas_dev=90, telas=17)  # 6 h → 1 dia
+        estoura = calcula(horas_dev=90, telas=18)  # 7 h → 2 dias
+        self.assertEqual(cabe.dias_fase_1, 1)
+        self.assertEqual(estoura.dias_fase_1, 2)
         self.assertTrue(alerta_contem(estoura, "não"))
-        self.assertIn("3 dias de levantamento", preco.markdown(estoura))
-        self.assertIn("no fim do terceiro dia útil", preco.markdown(estoura))
+        self.assertIn("2 dias de levantamento", preco.markdown(estoura))
+        self.assertIn("no fim do segundo dia útil", preco.markdown(estoura))
 
     def test_fase_b_a_mao_tambem_estica_a_fase_1(self):
         # O caminho manual é o menos exercitado e o único que faz a Fase B sozinha
-        # estourar os dois dias: 20 h de levantamento não cabem em 12 h.
+        # estourar o dia: 20 h de levantamento não cabem em 6 h.
         r = calcula(horas_dev=150, telas=8, horas_fase_b_manual=20)
-        self.assertEqual(r.horas_fase_1, 24)  # 20 h + 4 h de wireframe
+        self.assertEqual(r.horas_fase_1, 22)  # 20 h + 2 h de wireframe
         self.assertEqual(r.dias_fase_1, 4)
         self.assertTrue(alerta_contem(r, "ficou com 4 dias úteis"))
         self.assertIn("4 dias de levantamento", preco.markdown(r))
 
     def test_fase_b_a_mao_dentro_dos_dias_nao_estica(self):
-        r = calcula(horas_dev=150, telas=8, horas_fase_b_manual=8)
+        r = calcula(horas_dev=150, telas=8, horas_fase_b_manual=3)
         self.assertEqual(r.dias_fase_1, preco.DIAS_FASE_B)
         self.assertFalse(alerta_contem(r, "dias úteis, não"))
 
-    def test_a_fase_1_nunca_desce_do_piso_de_dois_dias(self):
-        r = calcula(horas_dev=40, telas=1)  # 8,5 h → caberia em 2 dias justos
+    def test_a_fase_1_nunca_desce_do_piso_de_um_dia(self):
+        r = calcula(horas_dev=40, telas=1)  # 4 h → caberia em menos de um dia
         self.assertEqual(r.dias_fase_1, preco.DIAS_FASE_B)
 
     def test_o_desenho_entra_no_calendario_de_desenvolvimento(self):
@@ -146,9 +152,9 @@ class TestDesenhoEWireframe(unittest.TestCase):
 
     def test_o_wireframe_nao_entra_no_calendario_de_dev(self):
         # Ele é hora da fase 1: não pode empurrar semana de desenvolvimento.
-        # 28 h de dev + 2 h de desenho fecham exatamente uma semana; a 1 h de
+        # 29 h de dev + 1 h de desenho fecham exatamente uma semana; a 1 h de
         # wireframe das 2 telas fica na fase 1 e não abre uma segunda semana.
-        r = calcula(horas_dev=28, telas=2)
+        r = calcula(horas_dev=29, telas=2)
         self.assertEqual(r.horas_execucao, 30)
         self.assertEqual(r.fases, 2)
 
@@ -156,14 +162,8 @@ class TestDesenhoEWireframe(unittest.TestCase):
         md = preco.markdown(calcula(horas_dev=150, telas=8))
         self.assertIn("o desenho das telas e o primeiro bloco", md)
 
-    def test_nenhum_dos_dois_recebe_fator_de_estimativa(self):
-        cru = calcula(horas_dev=90, telas=8)
-        com_fator = calcula(horas_dev=90, telas=8, fator_estimativa=1.5)
-        self.assertEqual(cru.horas_desenho, com_fator.horas_desenho)
-        self.assertEqual(cru.horas_wireframe, com_fator.horas_wireframe)
-
     def test_desenho_que_nao_cabe_na_primeira_semana_alerta(self):
-        r = calcula(horas_dev=30, telas=40, fases_manual=4)
+        r = calcula(horas_dev=30, telas=60, fases_manual=4)
         self.assertGreater(r.horas_desenho, r.cronograma[1].horas)
         self.assertTrue(alerta_contem(r, "não cabe nela inteiro"))
 
@@ -191,15 +191,15 @@ class TestLiquido(unittest.TestCase):
 
 class TestCorteDeTriagem(unittest.TestCase):
     def test_abaixo_do_minimo_dispara_descarte(self):
-        # 10 h de dev + 3 h de desenho + 8 h de Fase B + 2 h de wireframe = 23 h
+        # 10 h de dev + 3 h de desenho + 8 h de Fase B = 21 h → R$ 1.680 → R$ 1.700
         r = calcula(horas_dev=10, telas=3)
         self.assertLess(r.preco, preco.MINIMO_PROJETO)
         self.assertTrue(alerta_contem(r, "ABAIXO DO MÍNIMO:"))
 
     def test_exatamente_no_minimo_nao_descarta(self):
-        # 47 h de dev + 3 h de desenho + 8 h de Fase B + 2 h de wireframe = 60 h,
-        # × R$ 50 = R$ 3.000 exatos, o mínimo fictício dos testes.
-        r = calcula(horas_dev=47, telas=3)
+        # 34 h de dev + 2 h de desenho + 3 h de Fase B + 1 h de wireframe = 40 h,
+        # × R$ 50 = R$ 2.000 exatos, o mínimo fictício dos testes.
+        r = calcula(horas_dev=34, telas=3)
         self.assertEqual(r.preco, TEST_MIN_PROJECT)
         self.assertFalse(alerta_contem(r, "ABAIXO DO MÍNIMO:"))
 
@@ -208,18 +208,18 @@ class TestCorteDeTriagem(unittest.TestCase):
         # baixo, e nada é declarado ao cliente como teto de horas.
         for dev in (39, 41, 45):
             r = calcula(horas_dev=dev, telas=6)
-            self.assertEqual(r.horas_fase_b, 8, f"{dev} h")
+            self.assertEqual(r.horas_fase_b, 3, f"{dev} h")
             self.assertFalse(alerta_contem(r, "enxut"), f"{dev} h")
 
     def test_um_real_abaixo_do_minimo_descarta(self):
-        # 45 h + 3 h + 8 h + 2 h = 58 h × R$ 50 = R$ 2.900, um degrau abaixo do mínimo
-        r = calcula(horas_dev=45, telas=3)
-        self.assertEqual(r.preco, 2_900.0)
+        # 31 h + 2 h + 3 h + 1 h = 37 h × R$ 50 = R$ 1.850 → R$ 1.900, um degrau abaixo
+        r = calcula(horas_dev=31, telas=3)
+        self.assertEqual(r.preco, 1_900.0)
         self.assertTrue(alerta_contem(r, "ABAIXO DO MÍNIMO:"))
 
     def test_projeto_grande_mantem_a_fase_b_cheia(self):
         r = calcula(horas_dev=140, telas=8)
-        self.assertEqual(r.horas_fase_b, 8)
+        self.assertEqual(r.horas_fase_b, 3)
         self.assertGreater(r.preco, 5_000)
 
 
@@ -402,10 +402,10 @@ class TestInvarianteDoPrejuizo(unittest.TestCase):
                     self.assertTrue(alerta_contem(r, "Fase 1 descoberta"), f"{dev} h")
 
     def test_levantamento_pesado_sobe_a_entrada(self):
-        # 3 h de dev com 2 telas é vaga implausível, mas a régua não pode depender
+        # 1 h de dev com 2 telas e Fase B no teto da faixa é vaga implausível, mas a régua não pode depender
         # de plausibilidade: a entrada sobe para pelo menos cobrir a entrega que
         # ela paga. A fase 1 continua descoberta enquanto é feita, por desenho.
-        r = calcula(horas_dev=3, telas=2)
+        r = calcula(horas_dev=1, telas=2, horas_fase_b_manual=4)
         self.assertGreater(r.parcelas[0].percentual, 0.5)
         self.assertGreaterEqual(r.parcelas[0].percentual, r.cronograma[0].entregue_ate)
         self.assertTrue(alerta_contem(r, "virou o piso da entrada"))
@@ -493,7 +493,7 @@ class TestGuardas(unittest.TestCase):
             self.assertIn("2 fases", str(ctx.exception))
 
     def test_fase_sem_hora_nenhuma_e_erro_explicito(self):
-        # --semanas alto demais espalha as horas até sobrar entrega vazia. O
+        # --fases alto demais espalha as horas até sobrar entrega vazia. O
         # calendário derivado das horas nunca chega lá; o informado à mão chega.
         with self.assertRaises(ValueError) as ctx:
             calcula(horas_dev=1, telas=1, fases_manual=6)
@@ -521,12 +521,12 @@ class TestCalendario(unittest.TestCase):
     """O calendário conta só hora de trabalho. O tempo do cliente fica de fora."""
 
     def test_prazo_e_o_numero_de_fases(self):
-        # 150 h de dev + 8 h de desenho = 158 h → 6 semanas, mais a fase 1.
+        # 150 h de dev + 3 h de desenho = 153 h → 6 semanas, mais a fase 1.
         r = calcula(horas_dev=150, telas=8)
         self.assertEqual(r.fases, 7)
         self.assertEqual(len(r.cronograma), 7)
         self.assertEqual(len(r.parcelas), 7)
-        self.assertEqual(preco.prazo_texto(r.fases), "2 dias de levantamento + 6 semanas de desenvolvimento")
+        self.assertEqual(preco.prazo_texto(r.fases), "1 dia de levantamento + 6 semanas de desenvolvimento")
 
     def test_nao_soma_janela_de_aprovacao_do_cliente(self):
         # Regressão: a versão anterior somava 1,5 semana fixa de leitura do cliente,
@@ -543,9 +543,25 @@ class TestCalendario(unittest.TestCase):
     def test_duas_fases_com_fase_b_dominante_desiguala_a_entrada(self):
         # Projeto minúsculo: a fatia do levantamento passa da metade e vira o piso
         # da entrada. É o único jeito de uma régua de 2 fases não ser 50/50, e com
-        # a Fase B em 8 h só acontece bem abaixo do corte de triagem — o cenário
+        # a Fase B em 3 h só acontece bem abaixo do corte de triagem — o cenário
         # existe para a régua não depender de plausibilidade.
-        r = calcula(horas_dev=3, telas=2)
+        r = calcula(horas_dev=1, telas=2, horas_fase_b_manual=4)
+        self.assertEqual(r.fases, 2)
+        self.assertGreater(r.parcelas[0].percentual, 0.5)
+        self.assertTrue(alerta_contem(r, "virou o piso da entrada"))
+
+    def test_regua_de_duas_fases_escreve_uma_por_extenso(self):
+        # Regressão: extenso(1) caía no algarismo e a frase colada no texto de venda
+        # saía "e mais 1 de R$ ...".
+        r = calcula(horas_dev=24, telas=6)
+        self.assertEqual(r.fases, 2)
+        self.assertIn("e mais uma de", preco.frase_da_regua(r))
+
+    def test_alerta_da_entrada_mede_a_mesma_fatia_que_a_regua(self):
+        # A régua sobe a entrada pela fase 1 inteira (Fase B + wireframe). A
+        # checagem media só a Fase B e calava justamente quando a régua subiu: aqui a
+        # fase 1 vale 4 de 6 h, e a Fase B sozinha, 3 de 6, empata com a metade.
+        r = calcula(horas_dev=1, telas=1)
         self.assertEqual(r.fases, 2)
         self.assertGreater(r.parcelas[0].percentual, 0.5)
         self.assertTrue(alerta_contem(r, "virou o piso da entrada"))
@@ -562,9 +578,9 @@ class TestCalendario(unittest.TestCase):
 
     def test_alerta_da_fatia_nomeia_o_calendario_esticado_como_causa(self):
         # Regressão: o alerta acusava "estimativa de dev curta" mesmo quando quem
-        # tinha encolhido a fase de dev era o --semanas informado à mão.
-        r = calcula(horas_dev=20, telas=5, fases_manual=8)
-        self.assertTrue(alerta_contem(r, "esticado à mão com --semanas"))
+        # tinha encolhido a fase de dev era o --fases informado à mão.
+        r = calcula(horas_dev=5, telas=5, fases_manual=8)
+        self.assertTrue(alerta_contem(r, "esticado à mão com --fases"))
         self.assertFalse(alerta_contem(r, "estimativa de dev curta"))
 
     def test_fase_b_a_mao_fora_da_faixa_pede_registro(self):
@@ -572,7 +588,7 @@ class TestCalendario(unittest.TestCase):
         self.assertTrue(alerta_contem(r, "acima da faixa de referência"))
 
     def test_fase_b_a_mao_dentro_da_faixa_nao_alerta(self):
-        r = calcula(horas_dev=150, telas=8, horas_fase_b_manual=10)
+        r = calcula(horas_dev=150, telas=8, horas_fase_b_manual=4)
         self.assertFalse(alerta_contem(r, "faixa de referência"))
 
     def test_projeto_longo_alerta(self):
@@ -602,7 +618,7 @@ class TestPisoDeNegociacao(unittest.TestCase):
         # O piso usa a régua nominal, não a efetiva do preço: misturar os dois
         # arredondamentos fazia a entrada do piso não bater com o percentual.
         r = calcula(horas_dev=150, telas=8)
-        regua = preco.regua_das_fases(r.fases, r.horas_fase_b / r.horas_total)
+        regua = preco.regua_das_fases(r.fases, r.horas_fase_1 / r.horas_total)
         parcelas = preco.calcula_parcelas(r.piso, regua, ["x"] * r.fases)
         self.assertAlmostEqual(sum(p.valor for p in parcelas), r.piso, places=2)
 
@@ -634,40 +650,57 @@ class TestPisoDeNegociacao(unittest.TestCase):
         self.assertFalse(alerta_contem(r, "orçamento do cliente"))
 
 
-class TestFatorEstimativa(unittest.TestCase):
-    def test_fator_um_nao_muda_nada_nem_alerta(self):
-        cru = calcula(horas_dev=90, telas=8)
-        com_fator = calcula(horas_dev=90, telas=8, fator_estimativa=1.0)
-        self.assertEqual(cru.preco, com_fator.preco)
-        self.assertEqual(cru.horas_dev, com_fator.horas_dev)
-        self.assertFalse(alerta_contem(cru, "fator de estimativa"))
-
-    def test_fator_maior_sobe_horas_e_preco(self):
-        r = calcula(horas_dev=90, telas=8, fator_estimativa=1.3)
-        self.assertEqual(r.horas_dev, 117)  # ceil(90 × 1,3)
+class TestCorteDeTempo(unittest.TestCase):
+    def test_corte_de_tempo_reduz_as_horas_de_dev(self):
+        r = preco.calcula(horas_dev=90, telas=8)
+        self.assertEqual(r.horas_dev, 32)  # ceil(90 × 0,35 = 31,5)
         self.assertEqual(r.horas_dev_informado, 90)
-        self.assertGreater(r.preco, calcula(horas_dev=90, telas=8).preco)
-        self.assertTrue(alerta_contem(r, "fator de estimativa"))
+        self.assertIn("90 h × corte 0,35 |", preco.markdown(r))
 
-    def test_fator_nao_toca_na_fase_b(self):
-        cru = calcula(horas_dev=90, telas=8)
-        com_fator = calcula(horas_dev=90, telas=8, fator_estimativa=1.5)
-        self.assertEqual(cru.horas_fase_b, com_fator.horas_fase_b)
+    def test_faixa_da_fase_b_sai_do_corte(self):
+        base = preco.LEVANTAMENTO_FAIXA_BASE
+        esperado = tuple(round(h * preco.CORTE_DE_TEMPO) for h in base)
+        self.assertEqual(preco.LEVANTAMENTO_FAIXA, esperado)
 
-    def test_fator_arredonda_horas_para_cima(self):
-        r = calcula(horas_dev=90, telas=8, fator_estimativa=1.11)
-        self.assertEqual(r.horas_dev, 100)  # ceil(99,9)
+    def test_horas_inteiras_ignora_ruido_de_ponto_flutuante(self):
+        self.assertEqual(preco.horas_inteiras(21.000000000000004), 21)
+        self.assertEqual(preco.horas_inteiras(20.1), 21)
 
-    def test_fator_entra_no_calendario_e_nas_parcelas(self):
-        cru = calcula(horas_dev=90, telas=8)
-        com_fator = calcula(horas_dev=90, telas=8, fator_estimativa=1.4)
-        self.assertGreater(com_fator.fases, cru.fases)
-        self.assertGreater(len(com_fator.parcelas), len(cru.parcelas))
 
-    def test_markdown_mostra_a_origem_das_horas(self):
-        md = preco.markdown(calcula(horas_dev=90, telas=8, fator_estimativa=1.3))
-        self.assertIn("fator 1,30", md)
-        self.assertIn("90 h", md)
+class TestEtapas(unittest.TestCase):
+    def test_etapas_fecham_com_o_total_da_conta(self):
+        r = preco.calcula(horas_dev=90, telas=8, etapas_cheias=[40, 30, 12, 8])
+        self.assertEqual(
+            r.etapas,
+            [
+                ("Fechar o projeto no papel", 5),
+                ("Desenhar as telas", 3),
+                ("Construir o app", 14),  # 40 × 0,35
+                ("O que roda por trás das telas", 10),  # floor(10,5)
+                ("Testes e ajustes", 6),  # floor(4,2) + 2 de sobra
+                ("Publicar na loja", 2),  # floor(2,8)
+            ],
+        )
+        self.assertEqual(sum(h for _, h in r.etapas), r.horas_total)
+
+    def test_sobra_nunca_e_negativa_e_sempre_fecha(self):
+        for etapas in ([1, 1, 1, 1], [97, 1, 1, 1], [25, 25, 25, 25], [0, 0, 3, 0], [33, 33, 33, 1]):
+            r = preco.calcula(horas_dev=sum(etapas), telas=5, etapas_cheias=etapas)
+            self.assertTrue(all(h >= 0 for _, h in r.etapas), etapas)
+            self.assertEqual(sum(h for _, h in r.etapas), r.horas_total, etapas)
+
+    def test_soma_diferente_de_horas_recusa(self):
+        with self.assertRaises(ValueError):
+            preco.calcula(horas_dev=90, telas=8, etapas_cheias=[40, 30, 12, 7])
+
+    def test_markdown_traz_a_tabela_das_etapas(self):
+        md = preco.markdown(preco.calcula(horas_dev=90, telas=8, etapas_cheias=[40, 30, 12, 8]))
+        self.assertIn("## Etapas da proposta", md)
+        self.assertIn("| Testes e ajustes | 6 h |", md)
+
+    def test_sem_etapas_pede_o_argumento(self):
+        md = preco.markdown(preco.calcula(horas_dev=90, telas=8))
+        self.assertIn("Rode de novo com `--etapas`", md)
 
 
 class TestSaida(unittest.TestCase):
@@ -711,7 +744,7 @@ class TestSaida(unittest.TestCase):
         # Regressão: o parágrafo dizia "metade na assinatura e metade no aceite"
         # com a tabela logo acima mostrando 56,6% e 43,4%. Essa saída é colada no
         # analise.md e vira a Cláusula 2ª do contrato.
-        r = calcula(horas_dev=3, telas=2)
+        r = calcula(horas_dev=1, telas=2)
         md = preco.markdown(r)
         self.assertNotIn("metade na assinatura", md)
         self.assertIn(preco.pct_auto(r.parcelas[0].percentual) + " na assinatura", md)
@@ -832,21 +865,9 @@ class TestChecagens(unittest.TestCase):
         r = calcula(horas_dev=150, telas=8)
         self.assertEqual(preco.checagens(r), preco.checagens(r))
 
-    def test_o_que_calcula_pendura_e_o_que_checagens_devolve(self):
-        # O alerta que nasce no meio da conta (o fator de estimativa) fica na
-        # frente; o resto tem de ser exatamente a saída de checagens().
+    def test_os_alertas_sao_exatamente_a_saida_de_checagens(self):
         r = calcula(horas_dev=520, telas=20, orcamento_cliente=1_000)
-        avisos = preco.checagens(r)
-        self.assertEqual(r.alertas[-len(avisos):], avisos)
-
-    def test_alertas_do_meio_da_conta_sobrevivem_a_extracao(self):
-        r = calcula(horas_dev=90, telas=8, fator_estimativa=1.3)
-        self.assertTrue(alerta_contem(r, "fator de estimativa"))
-        self.assertNotIn(
-            "fator de estimativa",
-            " ".join(preco.checagens(r)).lower(),
-            "o alerta do fator não pode ser recalculado por checagens()",
-        )
+        self.assertEqual(r.alertas, preco.checagens(r))
 
 
 @unittest.skipUnless(

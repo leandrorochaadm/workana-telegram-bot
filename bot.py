@@ -64,19 +64,24 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-PROPOSAL_MODEL = "claude-opus-5-5"
-# Cheap first pass so the Opus call is spent only on jobs that fit the work offered
+PROPOSAL_MODEL = "claude-sonnet-5-5"
+# Cheap first pass so the Sonnet call is spent only on jobs that fit the work offered
 FIT_MODEL = "claude-haiku-4-5-20251001"
 FIT_TIMEOUT_SECONDS = 60
 FIT_PROMPT = """Você faz a triagem de vagas da Workana para um desenvolvedor freelancer.
 Ele aceita vagas para desenvolver software com telas: aplicativo mobile (Android, iOS,
 multiplataforma) ou sistema web (SaaS, painel, plataforma, área logada), do zero ou evoluindo
-um que já existe.
+um que já existe em Flutter (ver abaixo).
 
 Ele não aceita: landing page, site institucional, blog, loja montada em plataforma pronta
 (Shopify, WordPress, Wix, Nuvemshop), só design ou protótipo (UI/UX, Figma), bot, automação,
 integração ou scraping sem telas, planilha, tráfego pago, marketing, conteúdo, vídeo, suporte
 de TI, vaga de emprego fixo ou revenda de app pronto.
+
+Ele também não aceita terminar, continuar, corrigir ou dar manutenção num aplicativo ou sistema
+web que já existe e não foi feito em Flutter (React Native, Ionic, Kotlin, Java, Swift, Xamarin,
+.NET MAUI, FlutterFlow, React, Angular, Vue, Next.js, PHP, Laravel, Django, Bubble ou outra
+ferramenta). App ou sistema existente em Flutter, ou sem a tecnologia informada, segue valendo.
 
 Leia a vaga e responda só sim ou não: ela dá match? Na dúvida, quando a vaga pode ser um app
 ou sistema com telas, responda sim."""
@@ -84,7 +89,7 @@ ou sistema com telas, responda sim."""
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
 # connecting WARP, the deadline below, then one last job (page + Haiku triage + one
-# Opus call) and the commit.
+# Sonnet call) and the commit.
 # Revisions only start before the deadline, so they never add a call past it.
 PROPOSAL_TIMEOUT_SECONDS = 180
 PAGE_TIMEOUT_MS = 30_000
@@ -164,6 +169,8 @@ HOUR_PLACEHOLDERS = (
     "{{HORAS_LOJA}}",
     "{{HORAS_TOTAL}}",
 )
+# Fewest full hours a dev step can have and still show after preco.py's cut (3 at 0.35)
+MIN_STEP_HOURS = math.ceil(1 / preco.CORTE_DE_TEMPO)
 PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
 # Links are only a style alert for direct clients, but they get the Workana account suspended
 WORKANA_BLOCKING_RULES = ("endereço no texto",)
@@ -406,13 +413,11 @@ def configure_pricing(hourly_rate: str | None, min_project: str | None) -> bool:
 
 
 def client_deadline(r: preco.Resultado) -> str:
-    """The deadline as the client reads it: both units, spelled out."""
-    weeks = r.fases - 1
+    """The deadline as the client reads it, opening its own sentence with both units spelled out."""
+    days, weeks = r.dias_fase_1, r.fases - 1
+    days_text = "É um dia" if days == 1 else f"São {preco.extenso_masculino(days)} dias"
     weeks_text = "uma semana" if weeks == 1 else f"{preco.extenso(weeks)} semanas"
-    return (
-        f"{preco.extenso_masculino(r.dias_fase_1)} dias para fechar o projeto no papel "
-        f"e {weeks_text} de desenvolvimento"
-    )
+    return f"{days_text} para fechar o projeto no papel e {weeks_text} de desenvolvimento"
 
 
 def workana_findings(text: str) -> list[varredura.Achado]:
@@ -558,8 +563,10 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
     if draft.screens <= 0:
         raise ProposalError(f"estimativa sem telas ({draft.dev_hours} h)")
 
-    r = preco.calcula(horas_dev=draft.dev_hours, telas=draft.screens)
-    hours = step_hours(draft, r)
+    r = preco.calcula(
+        horas_dev=draft.dev_hours, telas=draft.screens, etapas_cheias=full_step_hours(draft)
+    )
+    hours = step_hours(r)
     expected = [*PRICE_PLACEHOLDERS, *(marker for marker, h in hours.items() if h > 0)]
     # Each exactly once: a repeated marker would print the price twice
     if sorted(found) != sorted(expected):
@@ -579,7 +586,10 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
     if len(installments) > 1:
         price += f" e mais {len(installments) - 1} de {preco.brl0(installments[1].valor)}"
     notes = [draft.notes.strip().rstrip(".")] if draft.notes.strip() else []
-    notes.append(f"{r.horas_total} h no total, {draft.dev_hours} de dev, {draft.screens} telas")
+    notes.append(
+        f"{r.horas_total} h no total, {r.horas_dev} de dev ({draft.dev_hours} antes do corte), "
+        f"{draft.screens} telas"
+    )
     if r.preco < preco.MINIMO_PROJETO:
         notes.append(f"abaixo do mínimo de {preco.brl0(preco.MINIMO_PROJETO)}")
     if r.fases - 1 > preco.SEMANAS_PROJETO_LONGO:
@@ -594,35 +604,40 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
     )
 
 
-def step_hours(draft: ProposalDraft, r: preco.Resultado) -> dict[str, int]:
-    """Hours of each proposal step, adding up to preco.py's total.
+def full_step_hours(draft: ProposalDraft) -> list[int]:
+    """The draft's four dev steps before preco.py's time cut, in preco.ETAPAS_DE_DEV order.
 
-    The first two steps come from preco.py; the tests step takes whatever the other
-    dev steps leave, which is where the skill puts the rounding.
+    The tests step takes whatever the other dev steps leave, which is where the skill
+    puts the rounding.
     """
     shown = draft.build_hours + draft.backend_hours + draft.store_hours
     if min(draft.build_hours, draft.backend_hours, draft.store_hours) < 0:
         raise ProposalError("horas por etapa negativas")
-    tests = r.horas_dev - shown
+    tests = draft.dev_hours - shown
     if draft.build_hours <= 0 or tests <= 0:
         raise ProposalError(
             f"horas por etapa ({shown} h em construção, bastidores e loja) sem sobra para testes "
-            f"dentro de dev_hours ({r.horas_dev} h)"
+            f"dentro de dev_hours ({draft.dev_hours} h)"
         )
-    return dict(
-        zip(
-            HOUR_PLACEHOLDERS,
-            (
-                r.horas_fase_1,
-                r.horas_desenho,
-                draft.build_hours,
-                draft.backend_hours,
-                tests,
-                draft.store_hours,
-                r.horas_total,
-            ),
+    steps = [draft.build_hours, draft.backend_hours, tests, draft.store_hours]
+    # Below this the cut floors the step to zero, and its marker would be left over
+    small = [
+        f"{name} ({hours} h)"
+        for name, hours in zip(preco.ETAPAS_DE_DEV, steps)
+        if 0 < hours < MIN_STEP_HOURS
+    ]
+    if small:
+        raise ProposalError(
+            f"etapa com menos de {MIN_STEP_HOURS} horas cheias zera no corte: {', '.join(small)}. "
+            f"Use {MIN_STEP_HOURS} horas ou mais, ou 0 hora tirando a etapa do texto"
         )
-    )
+    return steps
+
+
+def step_hours(r: preco.Resultado) -> dict[str, int]:
+    """Hours of each proposal step after the time cut, plus their sum, preco.py's total."""
+    steps = [hours for _, hours in r.etapas]
+    return dict(zip(HOUR_PLACEHOLDERS, (*steps, r.horas_total)))
 
 
 def job_content(project: dict[str, str], description: str) -> str:
@@ -630,7 +645,7 @@ def job_content(project: dict[str, str], description: str) -> str:
 
 
 def check_fit(oauth_token: str, project: dict[str, str], description: str) -> JobFit:
-    """Asks Haiku whether the job is an app or web system, before the Opus proposal."""
+    """Asks Haiku whether the job is an app or web system, before the Sonnet proposal."""
     output = call_claude(
         oauth_token,
         FIT_PROMPT,
