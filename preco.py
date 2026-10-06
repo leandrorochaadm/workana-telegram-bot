@@ -42,8 +42,9 @@ CORTE_DE_TEMPO = 0.35
 #
 # As 3 h cobrem as duas fases de requisitos (escopo de pré-venda e requisitos
 # detalhados), a análise técnica e o handoff para o desenvolvimento. **Não cobrem o
-# desenho das telas**: o wireframe tem linha própria na conta, sai por
-# HORAS_WIREFRAME_POR_TELA e é entregue na primeira semana de desenvolvimento.
+# desenho das telas**: o wireframe e o desenho têm linhas próprias na conta. O wireframe
+# (HORAS_WIREFRAME_POR_TELA) é interno e fica na fase 1; o desenho (HORAS_DESENHO_POR_TELA)
+# é entregue na primeira semana de desenvolvimento.
 #
 # A faixa não olha o número de telas: o que a Fase B produz é o entendimento do
 # negócio e das regras, e isso não cresce na proporção das telas — o que cresce com
