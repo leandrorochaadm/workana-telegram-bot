@@ -13,7 +13,7 @@ Como reserva, o próprio workflow roda de hora em hora (minuto 41), caso o Worke
 Também pode ser disparado manualmente na aba Actions.
 
 Configuração no repositório (Settings → Secrets and variables → Actions):
-- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`)
+- Secrets: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (e, para as propostas, `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY` e `PRICE_HOURLY_RATE`)
 - O relatório de uso do Claude (`usage.yml`) vai para o bot [@leandro_claude_notify_bot](https://t.me/leandro_claude_notify_bot): secret `USAGE_TELEGRAM_TOKEN` (token do BotFather) e, se o chat for outro, `USAGE_TELEGRAM_CHAT_ID` (sem ele, usa o `TELEGRAM_CHAT_ID`)
 - Variables: `KEYWORDS` (ex: `aplicativo,app`) e, opcional, `EXCLUDE_KEYWORDS` (ex: `jogo,wordpress,no code`)
 
@@ -86,8 +86,7 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
 - Cada envio ao Telegram é tentado até `TELEGRAM_SEND_ATTEMPTS` (3) vezes. Se o alerta sair
   e a proposta não, ela fica no `pending.json` criptografada com a `PROMPT_KEY` (o repositório
   é público), e a próxima execução manda só a proposta, sem repetir o alerta nem gerar outra.
-- Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`
-  ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
+- Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
 
 O Claude não faz a conta do preço. Ele estima as horas de desenvolvimento e o número de telas,
 reparte parte das horas entre as etapas (construção, bastidores e loja) e escreve a proposta com
@@ -113,14 +112,13 @@ quebrar os marcadores, vale a versão anterior. O `varredura.py` foi escrito par
 então o bot soma checagens da Workana, que suspende a conta: link, e-mail, telefone, site e
 convite para conversa contam como erro.
 
-O valor da hora e o valor mínimo de projeto são privados: no `preco.py` eles valem zero, e o bot
-os lê de `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT` (secrets no GitHub, `.env` no local). Os
-testes usam valores fictícios. Ao atualizar o `preco.py` a partir da skill, zere os dois de novo
-antes de commitar.
+O valor da hora e o valor mínimo de projeto são privados: no `preco.py` eles valem zero. O bot
+lê o valor da hora de `PRICE_HOURLY_RATE` (secret no GitHub, `.env` no local) e deixa o mínimo
+em zero, então orça toda vaga, por menor que seja. Os testes usam valores fictícios. Ao atualizar
+o `preco.py` a partir da skill, zere os dois de novo antes de commitar.
 
 ```bash
 gh secret set PRICE_HOURLY_RATE
-gh secret set PRICE_MIN_PROJECT
 ```
 
 A proposta é gerada pelo Claude Code em modo não interativo (`claude -p`), cobrado na
@@ -193,7 +191,7 @@ Os logs do Actions são públicos: o bot nunca imprime o texto da proposta.
    - `TELEGRAM_CHAT_ID`: chat_id de destino
    - `KEYWORDS`: palavras separadas por vírgula (ex: `aplicativo,app`)
    - `EXCLUDE_KEYWORDS`: opcional, palavras que descartam a vaga (ex: `jogo,wordpress,no code`)
-   - `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY`, `PRICE_HOURLY_RATE` e `PRICE_MIN_PROJECT`:
+   - `CLAUDE_CODE_OAUTH_TOKEN`, `PROMPT_KEY` e `PRICE_HOURLY_RATE`:
      opcionais, para gerar propostas (exige o
      Claude Code instalado: `npm install -g @anthropic-ai/claude-code@2.1.282`)
 

@@ -59,7 +59,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
     for var in (
         "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
-        "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY", "PRICE_HOURLY_RATE", "PRICE_MIN_PROJECT",
+        "CLAUDE_CODE_OAUTH_TOKEN", "PROMPT_KEY", "PRICE_HOURLY_RATE",
     ):
         monkeypatch.delenv(var, raising=False)
     (tmp_path / ".env").write_text(
@@ -209,11 +209,10 @@ def with_proposals(workdir, monkeypatch):
     with bot.ENV_FILE.open("a") as f:
         f.write(
             f"CLAUDE_CODE_OAUTH_TOKEN=oauth-test\nPROMPT_KEY={key}\n"
-            "PRICE_HOURLY_RATE=50\nPRICE_MIN_PROJECT=3000\n"
+            "PRICE_HOURLY_RATE=50\n"
         )
     # configure_pricing writes preco's module globals; restore them after the test
     monkeypatch.setattr(preco, "VALOR_HORA", preco.VALOR_HORA)
-    monkeypatch.setattr(preco, "MINIMO_PROJETO", preco.MINIMO_PROJETO)
     calls: list[tuple[str, str]] = []
 
     def fake_generate(_client, system, project, description, can_revise):
@@ -376,7 +375,7 @@ def test_main_skips_proposals_with_wrong_key(with_proposals, sent, monkeypatch) 
     assert len(sent) == 1
 
 
-@pytest.mark.parametrize("rates", ["", "PRICE_HOURLY_RATE=abc\nPRICE_MIN_PROJECT=3000\n", "PRICE_HOURLY_RATE=0\nPRICE_MIN_PROJECT=3000\n"])
+@pytest.mark.parametrize("rates", ["", "PRICE_HOURLY_RATE=abc\n", "PRICE_HOURLY_RATE=0\n"])
 def test_main_skips_proposals_without_valid_rates(with_proposals, sent, monkeypatch, capsys, rates) -> None:
     env = bot.ENV_FILE.read_text()
     bot.ENV_FILE.write_text(
@@ -600,7 +599,6 @@ def _fake_claude(
 @pytest.fixture
 def rates(monkeypatch):
     monkeypatch.setattr(preco, "VALOR_HORA", 50.0)
-    monkeypatch.setattr(preco, "MINIMO_PROJETO", 3_000.0)
 
 
 STEPS_TEXT = (
@@ -922,10 +920,10 @@ def test_price_proposal_drops_steps_without_hours(rates) -> None:
     assert not any("horas" in item for item in result.review if item.startswith("ERRO"))
 
 
-def test_price_proposal_flags_price_below_minimum(rates) -> None:
+def test_price_proposal_ignores_project_minimum(rates) -> None:
     result = bot.price_proposal(_draft(dev_hours=50, build_hours=20, backend_hours=15, store_hours=5))
 
-    assert "abaixo do mínimo de R$ 3 000" in result.notes
+    assert "mínimo" not in result.notes
 
 
 def test_price_proposal_flags_long_project(rates) -> None:
@@ -1107,10 +1105,11 @@ def test_format_notification_lists_review() -> None:
 
 
 def test_configure_pricing_sets_preco_rates(rates) -> None:
-    assert bot.configure_pricing("80", "4500") is True
-    assert (preco.VALOR_HORA, preco.MINIMO_PROJETO) == (80.0, 4500.0)
-    assert bot.configure_pricing("80", None) is False
-    assert bot.configure_pricing("-1", "4500") is False
+    assert bot.configure_pricing("80") is True
+    assert preco.VALOR_HORA == 80.0
+    assert preco.MINIMO_PROJETO == 0.0
+    assert bot.configure_pricing(None) is False
+    assert bot.configure_pricing("-1") is False
 
 
 def test_fetch_projects_follows_pages_merges_searches_and_skips_empty_ones(

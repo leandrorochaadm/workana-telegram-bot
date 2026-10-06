@@ -400,15 +400,18 @@ def fetch_description(url: str) -> str:
         return page.inner_text(".block-detail").strip()
 
 
-def configure_pricing(hourly_rate: str | None, min_project: str | None) -> bool:
-    """Loads the private rates into preco.py; False when either is missing or invalid."""
+def configure_pricing(hourly_rate: str | None) -> bool:
+    """Loads the private hourly rate into preco.py; False when it is missing or invalid.
+
+    The project minimum stays at zero: the bot prices every job, however small.
+    """
     try:
-        rate, minimum = float(hourly_rate or ""), float(min_project or "")
+        rate = float(hourly_rate or "")
     except ValueError:
         return False
-    if rate <= 0 or minimum <= 0:
+    if rate <= 0:
         return False
-    preco.VALOR_HORA, preco.MINIMO_PROJETO = rate, minimum
+    preco.VALOR_HORA = rate
     return True
 
 
@@ -590,8 +593,6 @@ def price_proposal(draft: ProposalDraft) -> Proposal:
         f"{r.horas_total} h no total, {r.horas_dev} de dev ({draft.dev_hours} antes do corte), "
         f"{draft.screens} telas"
     )
-    if r.preco < preco.MINIMO_PROJETO:
-        notes.append(f"abaixo do mínimo de {preco.brl0(preco.MINIMO_PROJETO)}")
     if r.fases - 1 > preco.SEMANAS_PROJETO_LONGO:
         notes.append("projeto longo: considere propor só a primeira metade do escopo")
     return Proposal(
@@ -897,14 +898,10 @@ def main() -> None:
     system = None
     if oauth_token and prompt_key and PROMPT_FILE.exists():
         pricing_ok = configure_pricing(
-            env.get("PRICE_HOURLY_RATE") or os.environ.get("PRICE_HOURLY_RATE"),
-            env.get("PRICE_MIN_PROJECT") or os.environ.get("PRICE_MIN_PROJECT"),
+            env.get("PRICE_HOURLY_RATE") or os.environ.get("PRICE_HOURLY_RATE")
         )
         if not pricing_ok:
-            print(
-                "Faltam PRICE_HOURLY_RATE e/ou PRICE_MIN_PROJECT válidos, seguindo sem propostas",
-                file=sys.stderr,
-            )
+            print("Falta PRICE_HOURLY_RATE válido, seguindo sem propostas", file=sys.stderr)
         elif shutil.which("claude") is None:
             print("Claude Code não instalado, seguindo sem propostas", file=sys.stderr)
         else:
