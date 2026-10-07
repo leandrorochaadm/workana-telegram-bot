@@ -68,7 +68,7 @@ O token expira (no máximo em 1 ano). Ao renovar, rode `npx wrangler secret put 
 ## Propostas com o Claude
 
 Para cada vaga que bate com as palavras-chave, o bot abre a página, lê a descrição e pede ao
-Claude (`claude-sonnet-5-5`) uma proposta. Chegam duas mensagens: uma com título, link, preço,
+Claude (`claude-opus-5-5`, esforço médio) uma proposta. Chegam duas mensagens: uma com título, link, preço,
 prazo, piso de negociação e observações; outra só com o texto da proposta, para copiar.
 
 - Antes da proposta, o Haiku (`claude-haiku-4-5-20251001`) faz uma triagem e responde só sim ou
@@ -86,6 +86,9 @@ prazo, piso de negociação e observações; outra só com o texto da proposta, 
 - Cada envio ao Telegram é tentado até `TELEGRAM_SEND_ATTEMPTS` (3) vezes. Se o alerta sair
   e a proposta não, ela fica no `pending.json` criptografada com a `PROMPT_KEY` (o repositório
   é público), e a próxima execução manda só a proposta, sem repetir o alerta nem gerar outra.
+- A proposta vai numa mensagem só, para copiar inteira. Se passar do limite do Telegram
+  (4096 caracteres), ela sai dividida em 2 mensagens, sem pedir revisão ao Claude; se não
+  couber nem em 2, a vaga chega sem proposta, com um aviso.
 - Sem `CLAUDE_CODE_OAUTH_TOKEN`, sem `PROMPT_KEY`, sem `PRICE_HOURLY_RATE` ou sem o comando `claude` no `PATH`, o bot envia só o aviso da vaga, sem proposta.
 
 O Claude não faz a conta do preço. Ele estima as horas de desenvolvimento e o número de telas,

@@ -223,7 +223,7 @@ def with_proposals(workdir, monkeypatch):
         if "vencido" in project["title"]:
             raise bot.ProposalError("claude saiu com código 1 (api_error_status=401)")
         if "longo" in project["title"]:
-            raise bot.ProposalTooLong("proposta passa 300 caracteres do limite do Telegram")
+            raise bot.ProposalTooLong("proposta não cabe em 2 mensagens do Telegram (9000 caracteres)")
         if "inesperado" in project["title"]:
             raise ValueError("saída do modelo com texto sigiloso")
         return PROPOSAL
@@ -255,6 +255,49 @@ def test_main_sends_proposal_alone_after_alert(with_proposals, sent, monkeypatch
     assert "Olá!" not in alert
     # Only the proposal text, to paste to the client as is
     assert proposal == "Olá! Proposta &lt;texto&gt;"
+
+
+def test_main_splits_proposal_too_long_for_one_message(with_proposals, sent, monkeypatch) -> None:
+    long_proposal = PROPOSAL.model_copy(update={"proposal": "Olá!" + " palavra" * 700})
+    monkeypatch.setattr(bot, "generate_proposal", lambda *_args, **_kwargs: long_proposal)
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+
+    bot.main()
+
+    alert, first, second = sent
+    assert "App novo" in alert
+    assert first.startswith("Olá!")
+    assert first + " " + second == bot.format_proposal(long_proposal)
+
+
+def test_main_resends_only_the_proposal_part_that_did_not_go_out(
+    with_proposals, sent, monkeypatch
+) -> None:
+    text = "Olá!" + " um" * 1000 + "\n\nfim" + " dois" * 300
+    long_proposal = PROPOSAL.model_copy(update={"proposal": text})
+    monkeypatch.setattr(bot, "generate_proposal", lambda *_args, **_kwargs: long_proposal)
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+    first_run: list[str] = []
+
+    def fail_second_part(_token, _chat_id, message):
+        if message.startswith("fim"):
+            raise requests.ConnectionError("offline")
+        first_run.append(message)
+
+    monkeypatch.setattr(bot, "send_telegram", fail_second_part)
+
+    with pytest.raises(SystemExit):
+        bot.main()
+
+    alert, first_part = first_run
+    assert "App novo" in alert and first_part.startswith("Olá!")
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, message: sent.append(message))
+    bot.main()
+
+    [second_part] = sent
+    assert second_part.startswith("fim")
+    assert bot.load_pending() == {}
 
 
 def test_main_defers_failed_proposal_to_next_run(with_proposals, sent, monkeypatch) -> None:
@@ -289,7 +332,7 @@ def test_main_tells_size_was_the_reason_without_another_run(
 
     assert len(with_proposals) == 1
     [alert] = sent
-    assert "longa demais para caber numa mensagem do Telegram" in alert
+    assert "longa demais para caber em duas mensagens do Telegram" in alert
     assert "erro ao ler a vaga" not in alert
     assert bot.load_seen() == {"x"}
     assert bot.load_pending() == {}
@@ -640,7 +683,7 @@ def test_generate_proposal_sends_prompt_and_job(monkeypatch, rates) -> None:
     cmd = calls[0]["cmd"]
     assert cmd[:2] == ["claude", "-p"]
     assert cmd[cmd.index("--model") + 1] == bot.PROPOSAL_MODEL
-    assert cmd[cmd.index("--effort") + 1] == "high"
+    assert cmd[cmd.index("--effort") + 1] == "medium"
     assert cmd[cmd.index("--system-prompt") + 1] == "prompt"
     assert json.loads(cmd[cmd.index("--json-schema") + 1]) == bot.ProposalDraft.model_json_schema()
     content = calls[0]["input"]
@@ -808,32 +851,33 @@ def test_generate_proposal_raises_when_first_draft_unusable_and_revision_fails(
         bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
 
-LONG_TEXT = DRAFT_TEXT + "\n\n" + "palavra " * 700
+# Paragraphs, as Claude writes them: the split cuts at a line break
+LONG_TEXT = DRAFT_TEXT + ("\n\n" + "palavra " * 100) * 7
 
 
-def test_generate_proposal_revises_proposal_too_long_for_one_message(monkeypatch, rates) -> None:
-    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal=LONG_TEXT), _answer()])
+def test_generate_proposal_splits_instead_of_revising_length(monkeypatch, rates) -> None:
+    calls = _fake_claude(monkeypatch, output=_answer(proposal=LONG_TEXT))
 
     result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
-    assert len(calls) == 2
-    assert "proposta longa demais" in calls[1]["input"]
-    assert bot.message_excess(result) <= 0
+    assert len(calls) == 1
+    assert len(bot.split_message(bot.format_proposal(result))) == 2
 
 
-def test_generate_proposal_never_returns_proposal_too_long(monkeypatch, rates) -> None:
-    calls = _fake_claude(monkeypatch, output=_answer(proposal=LONG_TEXT))
+def test_generate_proposal_never_returns_proposal_past_two_messages(monkeypatch, rates) -> None:
+    huge = DRAFT_TEXT + ("\n\n" + "palavra " * 100) * 11
+    calls = _fake_claude(monkeypatch, output=_answer(proposal=huge))
 
-    # Raised so main redoes the job on the next run instead of splitting the alert
-    with pytest.raises(bot.ProposalTooLong, match="limite do Telegram"):
+    with pytest.raises(bot.ProposalTooLong, match="não cabe em 2 mensagens do Telegram"):
         bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
-    assert len(calls) == 1 + bot.MAX_REVISIONS
+    assert len(calls) == 1
 
 
 def test_generate_proposal_falls_back_to_the_last_draft_that_fits(monkeypatch, rates) -> None:
-    # The revision fixes the dash but overflows: the first draft still goes out
+    # The revision fixes the dash but overflows two messages: the first draft still goes out
     first = DRAFT_TEXT + " Pronto — publicado."
-    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal=first), _answer(proposal=LONG_TEXT)])
+    huge = DRAFT_TEXT + ("\n\n" + "palavra " * 100) * 11
+    calls = _fake_claude(monkeypatch, outputs=[_answer(proposal=first), _answer(proposal=huge)])
 
     result = bot.generate_proposal("tok", "prompt", _project("x", "App"), "descrição")
 
@@ -1001,17 +1045,14 @@ def test_scan_accepts_proposal_within_size() -> None:
     assert not any("caracteres" in f.regra or "palavras" in f.regra for f in bot.scan_proposal(text))
 
 
-def test_proposal_problems_asks_to_cut_what_overflows_the_message(rates) -> None:
-    _, problems = bot.proposal_problems(_draft())
-    assert not any("longa demais" in problem for problem in problems)
-
+def test_proposal_problems_never_asks_to_cut_what_overflows_the_message(rates) -> None:
     long_draft = _draft(proposal=DRAFT_TEXT + "\n\n" + "palavra " * 600)
-    _, problems = bot.proposal_problems(long_draft)
-    [problem] = [p for p in problems if "longa demais" in p]
     message = bot.format_proposal(bot.price_proposal(long_draft))
-    excess = bot.telegram_len(message) - bot.TELEGRAM_MAX_CHARS
-    assert f"passa {excess} caracteres" in problem
-    assert f"Corte cerca de {excess + bot.REVISION_MARGIN_CHARS} caracteres" in problem
+    assert bot.telegram_len(message) > bot.TELEGRAM_MAX_CHARS
+
+    _, problems = bot.proposal_problems(long_draft)
+
+    assert problems == []
 
 
 def test_telegram_len_counts_text_after_parsing() -> None:

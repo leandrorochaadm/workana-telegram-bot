@@ -64,8 +64,9 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-PROPOSAL_MODEL = "claude-sonnet-5-5"
-# Cheap first pass so the Sonnet call is spent only on jobs that fit the work offered
+PROPOSAL_MODEL = "claude-opus-5-5"
+PROPOSAL_EFFORT = "medium"
+# Cheap first pass so the Opus call is spent only on jobs that fit the work offered
 FIT_MODEL = "claude-haiku-4-5-20251001"
 FIT_TIMEOUT_SECONDS = 60
 FIT_PROMPT = """Você faz a triagem de vagas da Workana para um desenvolvedor freelancer.
@@ -89,7 +90,7 @@ ou sistema com telas, responda sim."""
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
 # connecting WARP, the deadline below, then one last job (page + Haiku triage + one
-# Sonnet call) and the commit.
+# Opus call) and the commit.
 # Revisions only start before the deadline, so they never add a call past it.
 PROPOSAL_TIMEOUT_SECONDS = 180
 PAGE_TIMEOUT_MS = 30_000
@@ -100,12 +101,14 @@ MAX_PROPOSAL_ATTEMPTS = 3
 # Extra Claude calls per proposal to remove what the scan flagged as an error
 MAX_REVISIONS = 1
 TELEGRAM_MAX_CHARS = 4096
+# A proposal longer than one message goes out split in up to this many
+PROPOSAL_MAX_MESSAGES = 2
 # Covers a short Telegram hiccup without leaving the alert alone in the chat
 TELEGRAM_SEND_ATTEMPTS = 3
 TELEGRAM_RETRY_SECONDS = 2
 # The proposal goes out alone, after the alert, so it can be copied straight to the
-# client; it must fit one Telegram message. The revision loop shortens what goes over
-# and the code never trims the text. These replace varredura.py's 600-800 word range
+# client; what goes over one Telegram message is split, never revised or trimmed.
+# These replace varredura.py's 600-800 word range
 PROPOSAL_MIN_CHARS = 3890
 # The prompt's ceiling, just under the limit: the message uses all of it
 PROPOSAL_TARGET_CHARS = 4090
@@ -123,7 +126,7 @@ class ProposalError(Exception):
 
 
 class ProposalTooLong(ProposalError):
-    """The proposal does not fit one Telegram message, even after the revisions."""
+    """The proposal does not fit PROPOSAL_MAX_MESSAGES Telegram messages."""
 
 
 class JobFit(BaseModel):
@@ -497,17 +500,9 @@ def proposal_problems(draft: ProposalDraft) -> tuple[bool, list[str]]:
         if finding.trecho:
             problem += f' Trecho: "{finding.trecho}"'
         problems.append(problem)
-    excess = message_excess(proposal)
-    if excess > 0:
-        cut = excess + REVISION_MARGIN_CHARS
-        problems.append(
-            f"proposta longa demais: a mensagem passa {excess} caracteres do limite "
-            f"de {TELEGRAM_MAX_CHARS} do Telegram. Corte cerca de {cut} caracteres, umas "
-            f"{math.ceil(cut / CHARS_PER_WORD)} palavras, encurtando o porquê de cada etapa e "
-            "juntando frases, sem tirar etapa, preço, prazo ou pergunta."
-        )
+    # Too long is not a problem: the message is split instead.
     # A job too vague to price gets the short version on purpose: no padding for it
-    elif draft.dev_hours > 0 and (short := PROPOSAL_MIN_CHARS - utf16_len(proposal.proposal)) > 0:
+    if draft.dev_hours > 0 and (short := PROPOSAL_MIN_CHARS - utf16_len(proposal.proposal)) > 0:
         add = short + REVISION_MARGIN_CHARS
         problems.append(
             f"proposta curta demais: tem {utf16_len(proposal.proposal)} caracteres, abaixo do "
@@ -518,17 +513,15 @@ def proposal_problems(draft: ProposalDraft) -> tuple[bool, list[str]]:
     return True, problems
 
 
-def message_excess(proposal: Proposal) -> int:
-    """How far the proposal message goes past Telegram's limit; 0 or less fits."""
-    return telegram_len(format_proposal(proposal)) - TELEGRAM_MAX_CHARS
-
-
 def fitting_proposal(draft: ProposalDraft) -> Proposal:
-    """Prices the draft, refusing one that would not fit one Telegram message."""
+    """Prices the draft, refusing one that would not fit PROPOSAL_MAX_MESSAGES messages."""
     proposal = price_proposal(draft)
-    excess = message_excess(proposal)
-    if excess > 0:
-        raise ProposalTooLong(f"proposta passa {excess} caracteres do limite do Telegram")
+    message = format_proposal(proposal)
+    if len(split_message(message)) > PROPOSAL_MAX_MESSAGES:
+        raise ProposalTooLong(
+            f"proposta não cabe em {PROPOSAL_MAX_MESSAGES} mensagens do Telegram "
+            f"({telegram_len(message)} caracteres)"
+        )
     return proposal
 
 
@@ -646,7 +639,7 @@ def job_content(project: dict[str, str], description: str) -> str:
 
 
 def check_fit(oauth_token: str, project: dict[str, str], description: str) -> JobFit:
-    """Asks Haiku whether the job is an app or web system, before the Sonnet proposal."""
+    """Asks Haiku whether the job is an app or web system, before the Opus proposal."""
     output = call_claude(
         oauth_token,
         FIT_PROMPT,
@@ -671,13 +664,14 @@ def generate_proposal(
 ) -> Proposal:
     """Drafts the proposal, then asks Claude to fix what the scan flags, while time allows.
 
-    Scan errors left after the last revision still go out, listed in the alert. A
-    proposal that does not fit one Telegram message never does: it raises
-    ProposalTooLong, and the alert goes out saying so.
+    Scan errors left after the last revision still go out, listed in the alert. Length
+    is never revised: a proposal too long for one Telegram message goes out split, and
+    one that does not fit PROPOSAL_MAX_MESSAGES raises ProposalTooLong, and the alert
+    goes out saying so.
     """
     job = job_content(project, description)
     draft = run_claude(oauth_token, system, job)
-    # The latest draft that could go out (right markers, fits one message): a revision
+    # The latest draft that could go out (right markers, fits the messages): a revision
     # that breaks it, or a revision call that fails, must not throw it away
     usable: Proposal | None = None
     for _ in range(MAX_REVISIONS):
@@ -713,7 +707,7 @@ def run_claude(oauth_token: str, system: str, content: str) -> ProposalDraft:
         model=PROPOSAL_MODEL,
         schema=ProposalDraft,
         timeout=PROPOSAL_TIMEOUT_SECONDS,
-        effort="high",
+        effort=PROPOSAL_EFFORT,
     )
     return ProposalDraft.model_validate(output)
 
@@ -875,6 +869,17 @@ def send_with_retry(token: str, chat_id: str, text: str) -> None:
             time.sleep(TELEGRAM_RETRY_SECONDS)
 
 
+def send_chunks(token: str, chat_id: str, chunks: list[str]) -> None:
+    """Sends each chunk, dropping it from the list once it goes out.
+
+    On a failure the list keeps only what did not go out, so it can be stored and sent
+    later without repeating the parts already in the chat.
+    """
+    while chunks:
+        send_with_retry(token, chat_id, chunks[0])
+        chunks.pop(0)
+
+
 def main() -> None:
     # The proposal deadline counts from here: the listing scrape eats the same job timeout
     started = time.monotonic()
@@ -953,11 +958,14 @@ def main() -> None:
                 message = _decrypt(cipher, project["unsent_proposal"])
                 if message is not None:
                     # The alert already went out: only the proposal is missing
+                    chunks = split_message(message)
                     try:
-                        send_with_retry(token, chat_id, message)
+                        send_chunks(token, chat_id, chunks)
                     except requests.RequestException as exc:
                         failed += 1
                         print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
+                        pending[project["id"]]["unsent_proposal"] = _encrypt(cipher, chunks)
+                        save_state()
                         continue
                     seen.add(project["id"])
                     pending.pop(project["id"], None)
@@ -1004,7 +1012,7 @@ def main() -> None:
                         deferred += 1
                         continue
                     if too_long:
-                        error = "ficou longa demais para caber numa mensagem do Telegram"
+                        error = "ficou longa demais para caber em duas mensagens do Telegram"
                     else:
                         error = "erro ao ler a vaga ou falar com o Claude"
             if off_profile:
@@ -1020,24 +1028,21 @@ def main() -> None:
                 turned_down += 1
                 continue
             alert_sent = False
+            # Its own message, to copy whole; split only when it is longer than one
+            proposal_chunks = split_message(format_proposal(proposal)) if proposal else []
             try:
                 for chunk in split_message(format_notification(project, proposal, error)):
                     send_with_retry(token, chat_id, chunk)
                 alert_sent = True
-                if proposal:
-                    # Its own message, to copy whole: generate_proposal never returns one
-                    # that does not fit, so it is never split
-                    send_with_retry(token, chat_id, format_proposal(proposal))
+                send_chunks(token, chat_id, proposal_chunks)
             except requests.RequestException as exc:
                 failed += 1
                 print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
                 entry = _pending_entry(project)
-                if alert_sent and proposal and cipher:
-                    # The next run sends only this message, not a second alert and a
+                if alert_sent and proposal_chunks and cipher:
+                    # The next run sends only the parts left, not a second alert and a
                     # different proposal
-                    entry["unsent_proposal"] = cipher.encrypt(
-                        format_proposal(proposal).encode()
-                    ).decode()
+                    entry["unsent_proposal"] = _encrypt(cipher, proposal_chunks)
                 # Otherwise the next run re-sends the whole alert, proposal included
                 pending[project["id"]] = entry
                 save_state()
@@ -1070,6 +1075,11 @@ def triage(oauth_token: str, project: dict[str, str], description: str) -> bool:
         detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
         print(f"Triagem falhou em {project['url']}, gerando proposta: {detail}", file=sys.stderr)
         return True
+
+
+def _encrypt(cipher: Fernet, chunks: list[str]) -> str:
+    """The proposal parts not sent yet, stored encrypted since the repo is public."""
+    return cipher.encrypt("\n".join(chunks).encode()).decode()
 
 
 def _decrypt(cipher: Fernet | None, token: str) -> str | None:
