@@ -77,7 +77,8 @@ um que já existe em Flutter (ver abaixo).
 Ele não aceita: landing page, site institucional, blog, loja montada em plataforma pronta
 (Shopify, WordPress, Wix, Nuvemshop), só design ou protótipo (UI/UX, Figma), bot, automação,
 integração ou scraping sem telas, planilha, tráfego pago, marketing, conteúdo, vídeo, suporte
-de TI, vaga de emprego fixo ou revenda de app pronto.
+de TI, vaga de emprego fixo ou revenda de app pronto. Também não aceita aplicativo ou sistema
+feito só para publicar ou agendar posts em redes sociais (Instagram, Facebook, TikTok, LinkedIn).
 
 Ele também não aceita terminar, continuar, corrigir ou dar manutenção num aplicativo ou sistema
 web que já existe e não foi feito em Flutter (React Native, Ionic, Kotlin, Java, Swift, Xamarin,
