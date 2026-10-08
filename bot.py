@@ -48,6 +48,8 @@ REJECTED_FILE = DATA_DIR / "rejected.json"
 FIT_PROMPT_FILE = PROPOSTA_DIR / "prompts" / "fit_prompt.md"
 # One folder per proposal, next to the ones written by hand with the same skill
 GENERATED_DIR = PROPOSTA_DIR / "generated"
+# Where the alert links: proposta's default branch on GitHub, the one the workflows push to
+PROPOSTA_BLOB_URL = "https://github.com/leandrorochaadm/proposta/blob/main"
 # The proposta-freela skill, a symlink proposal.yml points at the dotfiles checkout: the
 # skill runs its scripts by this absolute path
 SKILL_DIR = Path.home() / ".claude" / "skills" / "proposta-freela"
@@ -133,6 +135,20 @@ GITHUB_OUTPUT_ENV = "GITHUB_OUTPUT"
 # monitor.yml dispatches proposal.yml when this output is true
 HAS_QUEUE_OUTPUT = "has_queue"
 CLAUDE_CLI = "claude"
+# publish_proposal's git steps, each run as `git -C <proposta checkout> ...` with the
+# credential actions/checkout left in that clone
+GIT_CLI = "git"
+GIT_REPO_FLAG = "-C"
+# A clone has it; without it, `git -C proposta` would find the enclosing public repo
+GIT_METADATA_DIR = ".git"
+GIT_ADD = ("add",)
+GIT_COMMIT = ("commit", "-m")
+# seen.json may be dirty from the alerts sent earlier in the same run
+GIT_PULL = ("pull", "--rebase", "--autostash")
+GIT_PUSH = ("push",)
+# Per step: the four together still fit proposal.yml's 30 min after the agent's 20
+GIT_TIMEOUT_SECONDS = 60
+PROPOSAL_COMMIT_MESSAGE = "chore: add workana proposal {folder}"
 
 
 class ProposalError(Exception):
@@ -494,6 +510,59 @@ def generate_proposal(
     return Proposal(folder=folder.name, price=summary.price, deadline=summary.deadline)
 
 
+def _repo_path(path: Path) -> str:
+    """`path` as the proposta repo names it: relative to the checkout, with / separators."""
+    return path.relative_to(PROPOSTA_DIR).as_posix()
+
+
+def proposal_url(folder: str) -> str:
+    """The proposal's proposta.md on GitHub; it opens once publish_proposal has pushed it."""
+    return f"{PROPOSTA_BLOB_URL}/{_repo_path(GENERATED_DIR / folder / PROPOSAL_FILE)}"
+
+
+def publish_proposal(folder: str) -> bool:
+    """Commits GENERATED_DIR / folder with pending.json and pushes it to the proposta repo.
+
+    pending.json, already holding the job in ALERT with its proposal, goes in the same
+    commit, so origin never has the folder while the job still waits there for one.
+    False when a step fails, logged with the step and its exit code only: git's own
+    output names files and remotes, and the Actions logs are public. The workflow's
+    Save state step pushes again at the end of the run.
+    """
+    if not (PROPOSTA_DIR / GIT_METADATA_DIR).exists():
+        print("Proposta não publicada: proposta/ não é um clone do git", file=sys.stderr)
+        return False
+    steps = (
+        (*GIT_ADD, _repo_path(GENERATED_DIR / folder), _repo_path(PENDING_FILE)),
+        (*GIT_COMMIT, PROPOSAL_COMMIT_MESSAGE.format(folder=folder)),
+        GIT_PULL,
+        GIT_PUSH,
+    )
+    for args in steps:
+        try:
+            result = subprocess.run(
+                [GIT_CLI, GIT_REPO_FLAG, str(PROPOSTA_DIR), *args],
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # The exception text quotes the command, folder name included
+            print(
+                f"Proposta não publicada: git {args[0]} falhou ({type(exc).__name__})",
+                file=sys.stderr,
+            )
+            return False
+        if result.returncode != 0:
+            print(
+                f"Proposta não publicada: git {args[0]} saiu com código {result.returncode}",
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
 def call_claude(
     oauth_token: str,
     system: str,
@@ -572,7 +641,11 @@ def call_claude(
 
 
 def format_notification(
-    project: dict[str, str], proposal: Proposal | None, error: str | None
+    project: dict[str, str],
+    proposal: Proposal | None,
+    error: str | None,
+    *,
+    published: bool = False,
 ) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
     if proposal:
@@ -580,6 +653,11 @@ def format_notification(
             f"\n\n💰 <b>Preço:</b> {html.escape(proposal.price)}"
             f"\n⏱ <b>Prazo:</b> {html.escape(proposal.deadline)}"
         )
+        if published:
+            text += f'\n📄 <a href="{html.escape(proposal_url(proposal.folder))}">Proposta</a>'
+        else:
+            # The workflow's Save state step pushes it again at the end of the run
+            text += "\n⚠️ Proposta gravada, mas não subiu para o GitHub."
     elif error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
@@ -660,11 +738,21 @@ def send_with_retry(token: str, chat_id: str, text: str) -> None:
 
 
 def _send_alert(
-    token: str, chat_id: str, project: dict, proposal: Proposal | None, error: str | None
+    token: str,
+    chat_id: str,
+    project: dict,
+    proposal: Proposal | None,
+    error: str | None,
+    *,
+    published: bool = False,
 ) -> bool:
-    """Sends the job's alert; False, logged, when Telegram still fails after the retries."""
+    """Sends the job's alert; False, logged, when Telegram still fails after the retries.
+
+    `published` says the proposal reached GitHub, so the alert links to it.
+    """
     try:
-        for chunk in split_message(format_notification(project, proposal, error)):
+        text = format_notification(project, proposal, error, published=published)
+        for chunk in split_message(text):
             send_with_retry(token, chat_id, chunk)
     except requests.RequestException as exc:
         print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
@@ -836,7 +924,7 @@ def run_monitor(
 
 def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
     """proposal.yml: sends the alerts left over, then writes the oldest queued proposal
-    with the agent and sends its alert."""
+    with the agent, publishes it to the proposta repo and sends its alert."""
     skill = SKILL_FILE.read_text() if SKILL_FILE.is_file() else None
     # Counted as a failed try on the oldest job, so the queue never stalls for good
     blocker = None
@@ -854,6 +942,23 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
         save_seen(seen)
         save_pending(pending)
 
+    # Each run starts from a fresh checkout: a written proposal whose folder is not in it
+    # never reached origin (its commit failed and Save state pushed only pending.json),
+    # so its link would not open. Written again, keeping the tries so far
+    for job in pending.values():
+        proposal = job.get("proposal")
+        if (
+            job["status"] is JobStatus.ALERT
+            and proposal
+            and not (GENERATED_DIR / proposal.folder).is_dir()
+        ):
+            print(
+                f"Pasta da proposta de {job['url']} não está no repositório, gerando de novo",
+                file=sys.stderr,
+            )
+            del job["proposal"]
+            job["status"] = JobStatus.PROPOSAL
+
     # dicts keep insertion order, so each status comes oldest first
     candidates = [
         {"id": pid, **job}
@@ -862,9 +967,11 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
         if job["status"] is status
     ]
     proposals_left = MAX_PROPOSALS_PER_RUN
-    sent = generated = failed = deferred = 0
+    sent = generated = unpublished = failed = deferred = 0
     try:
         for project in candidates:
+            # A job already in ALERT has its folder in this fresh checkout, so on origin too
+            published = True
             if project["status"] is JobStatus.PROPOSAL:
                 if proposals_left <= 0:
                     # The rest waits for the next dispatch
@@ -894,9 +1001,15 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
                 # alert, without writing the proposal again
                 pending[project["id"]] = _pending_entry(project)
                 save_state()
+                if "proposal" in project:
+                    # Before the alert, whose link only opens once the file is on GitHub;
+                    # pending.json, just saved with the job in ALERT, goes in the same commit
+                    published = publish_proposal(project["proposal"].folder)
+                    if not published:
+                        unpublished += 1
             proposal = project.get("proposal")
             error = None if proposal else "erro ao gerar a proposta"
-            if _send_alert(token, chat_id, project, proposal, error):
+            if _send_alert(token, chat_id, project, proposal, error, published=published):
                 seen.add(project["id"])
                 pending.pop(project["id"], None)
                 save_state()
@@ -908,8 +1021,8 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
         save_state()
 
     print(
-        f"{generated} propostas escritas, {sent} alertas enviados, {deferred} adiadas, "
-        f"{failed} com falha."
+        f"{generated} propostas escritas, {unpublished} sem publicar, {sent} alertas enviados, "
+        f"{deferred} adiadas, {failed} com falha."
     )
     if failed:
         sys.exit(1)

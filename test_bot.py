@@ -1,7 +1,10 @@
 import json
+import os
+import shutil
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -634,16 +637,26 @@ def test_format_notification_escapes_title_and_error() -> None:
     )
 
 
-def test_format_notification_shows_price_and_deadline() -> None:
-    proposal = bot.Proposal(folder="f", price="R$ <6 000>", deadline="1 dia & 3 semanas")
+def test_format_notification_shows_price_deadline_and_link() -> None:
+    proposal = bot.Proposal(
+        folder="2026-10-07-10-00-workana-app", price="R$ <6 000>", deadline="1 dia & 3 semanas"
+    )
 
-    text = bot.format_notification(_project("x", "App"), proposal, "ignorado")
+    text = bot.format_notification(_project("x", "App"), proposal, "ignorado", published=True)
 
-    # The proposal wins over an error; the link to proposta.md comes in step 08
+    # The proposal wins over an error
     assert text == (
         "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
-        "💰 <b>Preço:</b> R$ &lt;6 000&gt;\n⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas"
+        "💰 <b>Preço:</b> R$ &lt;6 000&gt;\n⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas\n"
+        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
+        '2026-10-07-10-00-workana-app/proposta.md">Proposta</a>'
     )
+    # Not on GitHub yet: a warning in place of a link that would not open
+    unpublished = bot.format_notification(_project("x", "App"), proposal, None)
+    assert unpublished.endswith(
+        "⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas\n⚠️ Proposta gravada, mas não subiu para o GitHub."
+    )
+    assert "github.com" not in unpublished
 
 
 def _fake_claude(
@@ -925,15 +938,56 @@ def test_generate_proposal_cleans_folder_on_failure(
 AGENT_PROPOSAL = bot.Proposal(
     folder="2026-10-07-10-00-workana-app-a", price="R$ 6 000", deadline="1 dia + 3 semanas"
 )
-AGENT_ALERT_TAIL = "\n\n💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas"
+
+
+def _alert_tail(proposal: bot.Proposal) -> str:
+    """The alert's lines after the job link, for a proposal that reached GitHub."""
+    link = (
+        "https://github.com/leandrorochaadm/proposta/blob/main/generated/"
+        f"{proposal.folder}/proposta.md"
+    )
+    return (
+        f"\n\n💰 <b>Preço:</b> {proposal.price}\n⏱ <b>Prazo:</b> {proposal.deadline}"
+        f'\n📄 <a href="{link}">Proposta</a>'
+    )
+
+
+AGENT_ALERT_TAIL = _alert_tail(AGENT_PROPOSAL)
+
+
+def _write_folder(proposal: bot.Proposal) -> Path:
+    """The proposal's folder in GENERATED_DIR, as the agent leaves it."""
+    folder = bot.GENERATED_DIR / proposal.folder
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, text in AGENT_FILES.items():
+        (folder / name).write_text(text)
+    return folder
 
 
 @pytest.fixture
-def with_agent(skill, monkeypatch):
-    """proposal.yml's setup: OAuth token, the skill (from the skill fixture) and the claude CLI.
+def published(monkeypatch):
+    """Fakes publish_proposal, so no test runs git on its own.
+
+    `calls` gets (folder, pending.json as on disk at that moment) per call; the push
+    fails while `ok` is False.
+    """
+    state = SimpleNamespace(calls=[], ok=True)
+
+    def fake_publish(folder: str) -> bool:
+        state.calls.append((folder, json.loads(bot.PENDING_FILE.read_text())))
+        return state.ok
+
+    monkeypatch.setattr(bot, "publish_proposal", fake_publish)
+    return state
+
+
+@pytest.fixture
+def with_agent(skill, published, monkeypatch):
+    """proposal.yml's setup: OAuth token, the skill (from the skill fixture), the claude
+    CLI and, through the published fixture, a fake publish_proposal.
 
     Returns (token, skill text, job id, description) for each generate_proposal call. The
-    agent fails on jobs whose title has "erro".
+    agent writes AGENT_PROPOSAL's folder, or fails on jobs whose title has "erro".
     """
     with bot.ENV_FILE.open("a") as f:
         f.write("CLAUDE_CODE_OAUTH_TOKEN=oauth-test\n")
@@ -943,6 +997,7 @@ def with_agent(skill, monkeypatch):
         calls.append((oauth_token, skill_text, project["id"], description))
         if "erro" in project["title"]:
             raise ValueError("saída do agente com texto sigiloso")
+        _write_folder(AGENT_PROPOSAL)
         return AGENT_PROPOSAL
 
     monkeypatch.setattr(bot, "generate_proposal", fake_generate_proposal)
@@ -1029,29 +1084,37 @@ def test_propose_handles_one_job_per_run(with_agent, sent) -> None:
     }
 
 
-def test_propose_sends_alert_status_first_without_agent(with_agent, sent) -> None:
+def test_propose_sends_alert_status_first_without_agent(with_agent, published, sent) -> None:
+    written = bot.Proposal(
+        folder="2026-10-06-09-00-workana-app-b", price="R$ 3 000", deadline="2 semanas"
+    )
+    _write_folder(written)
     bot.save_pending(
         {
             "a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a"),
             "b": _queued(
-                "b", "App b", bot.JobStatus.ALERT, description="descrição b", proposal=AGENT_PROPOSAL
+                "b", "App b", bot.JobStatus.ALERT, description="descrição b", proposal=written
             ),
         }
     )
 
     bot.main(PROPOSE_ARGV)
 
-    # b only missed its alert: it goes first, with no agent call, though a is older
+    # b only missed its alert: it goes first, with no agent call and no new commit,
+    # though a is older
     assert sent == [
-        f"🆕 <b>App b</b>\nhttps://www.workana.com/job/b{AGENT_ALERT_TAIL}",
+        f"🆕 <b>App b</b>\nhttps://www.workana.com/job/b{_alert_tail(written)}",
         f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}",
     ]
     assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert [folder for folder, _ in published.calls] == [AGENT_PROPOSAL.folder]
     assert bot.load_seen() == {"a", "b"}
     assert bot.load_pending() == {}
 
 
-def test_propose_keeps_written_proposal_when_alert_fails(with_agent, sent) -> None:
+def test_alert_status_is_resent_without_regenerating(
+    with_agent, published, sent, monkeypatch
+) -> None:
     bot.save_pending(
         {"a": _queued("a", "App FALHA", bot.JobStatus.PROPOSAL, description="descrição a")}
     )
@@ -1060,9 +1123,8 @@ def test_propose_keeps_written_proposal_when_alert_fails(with_agent, sent) -> No
         bot.main(PROPOSE_ARGV)
 
     assert exc.value.code == 1
-    assert len(with_agent) == 1
     assert sent == []
-    # The next run sends only the alert, without a second agent call
+    # Written and published; only the alert is missing
     assert bot.load_pending() == {
         "a": _queued(
             "a",
@@ -1072,7 +1134,105 @@ def test_propose_keeps_written_proposal_when_alert_fails(with_agent, sent) -> No
             proposal=AGENT_PROPOSAL,
         )
     }
+    assert [folder for folder, _ in published.calls] == [AGENT_PROPOSAL.folder]
     assert bot.load_seen() == set()
+
+    # Telegram is back; the next checkout has the folder
+    monkeypatch.setattr(bot, "send_telegram", lambda _token, _chat_id, text: sent.append(text))
+    bot.main(PROPOSE_ARGV)
+
+    # Only the alert: no second agent call and no second commit
+    assert len(with_agent) == 1
+    assert len(published.calls) == 1
+    assert sent == [f"🆕 <b>App FALHA</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}"]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+
+def test_alert_has_proposal_link(with_agent, published, sent) -> None:
+    bot.save_pending(
+        {"a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    # Published with pending.json already holding the job in ALERT and its proposal: one
+    # commit for both
+    assert published.calls == [
+        (
+            "2026-10-07-10-00-workana-app-a",
+            {
+                "a": {
+                    "title": "App a",
+                    "url": "https://www.workana.com/job/a",
+                    "status": "alert",
+                    "attempts": 0,
+                    "description": "descrição a",
+                    "proposal": {
+                        "folder": "2026-10-07-10-00-workana-app-a",
+                        "price": "R$ 6 000",
+                        "deadline": "1 dia + 3 semanas",
+                    },
+                }
+            },
+        )
+    ]
+    # The link only goes out because the publish came first and said it pushed
+    assert sent == [
+        "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
+        "💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas\n"
+        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
+        '2026-10-07-10-00-workana-app-a/proposta.md">Proposta</a>'
+    ]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+
+def test_alert_without_link_when_push_fails(with_agent, published, sent) -> None:
+    published.ok = False
+    bot.save_pending(
+        {"a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == [
+        "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
+        "💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas\n"
+        "⚠️ Proposta gravada, mas não subiu para o GitHub."
+    ]
+    # Alerted, so done: the workflow's Save state pushes the folder's commit later
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+    assert (bot.GENERATED_DIR / AGENT_PROPOSAL.folder / bot.PROPOSAL_FILE).is_file()
+
+
+def test_alert_status_with_missing_folder_regenerates(with_agent, published, sent, capsys) -> None:
+    lost = bot.Proposal(folder="2026-10-06-09-00-workana-app-a", price="R$ 1 000", deadline="1 dia")
+    bot.save_pending(
+        {
+            "a": _queued(
+                "a",
+                "App a",
+                bot.JobStatus.ALERT,
+                attempts=1,
+                description="descrição a",
+                proposal=lost,
+            )
+        }
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    # Its commit never reached origin: written again, published and alerted with the
+    # new folder, never with the lost one
+    assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert [folder for folder, _ in published.calls] == [AGENT_PROPOSAL.folder]
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}"]
+    err = capsys.readouterr().err
+    assert "https://www.workana.com/job/a" in err and "gerando de novo" in err
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
 
 
 def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, capsys) -> None:
@@ -1145,6 +1305,113 @@ def test_propose_without_skill_counts_attempt(
     assert bot.load_pending() == {
         "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
     }
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+@pytest.fixture
+def proposta_repo(workdir, monkeypatch):
+    """The proposta checkout as a real clone of a local bare origin, which it returns.
+
+    The developer's global and system git settings (signing, hooks, default branch)
+    stay out, for these commands and for publish_proposal's.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git não instalado")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    origin = workdir / "origin.git"
+    _git(workdir, "init", "-q", "--bare", "-b", "main", str(origin))
+    bot.save_seen(set())
+    bot.save_pending({})
+    _git(bot.PROPOSTA_DIR, "init", "-q", "-b", "main")
+    # What proposal.yml's "Configure git author" step sets on the runner
+    _git(bot.PROPOSTA_DIR, "config", "user.name", "github-actions[bot]")
+    _git(bot.PROPOSTA_DIR, "config", "user.email", "bot@example.com")
+    _git(bot.PROPOSTA_DIR, "add", "-A")
+    _git(bot.PROPOSTA_DIR, "commit", "-q", "-m", "chore: import state")
+    _git(bot.PROPOSTA_DIR, "remote", "add", "origin", str(origin))
+    _git(bot.PROPOSTA_DIR, "push", "-q", "-u", "origin", "main")
+    return origin
+
+
+def test_publish_proposal_commits_folder_and_pending(proposta_repo, workdir) -> None:
+    # A proposal written by hand reached origin meanwhile: the publish rebases on it
+    other = workdir / "other"
+    _git(workdir, "clone", "-q", str(proposta_repo), str(other))
+    _git(other, "config", "user.name", "Leandro")
+    _git(other, "config", "user.email", "leandro@example.com")
+    (other / "generated" / "manual").mkdir(parents=True)
+    (other / "generated" / "manual" / "proposta.md").write_text("Feita à mão.")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-q", "-m", "chore: add manual proposal")
+    _git(other, "push", "-q")
+    folder = _write_folder(AGENT_PROPOSAL)
+    bot.save_pending(
+        {
+            "a": _queued(
+                "a", "App a", bot.JobStatus.ALERT, description="descrição a", proposal=AGENT_PROPOSAL
+            )
+        }
+    )
+    # Alerts sent earlier in the run left seen.json dirty, outside the commit
+    bot.save_seen({"old"})
+
+    assert bot.publish_proposal(folder.name) is True
+
+    assert _git(proposta_repo, "log", "--format=%s", "main").splitlines() == [
+        "chore: add workana proposal 2026-10-07-10-00-workana-app-a",
+        "chore: add manual proposal",
+        "chore: import state",
+    ]
+    # The folder and pending.json in one commit, nothing else
+    assert _git(proposta_repo, "show", "--name-only", "--format=", "main").splitlines() == [
+        "data/pending.json",
+        "generated/2026-10-07-10-00-workana-app-a/analise.md",
+        "generated/2026-10-07-10-00-workana-app-a/proposta.md",
+    ]
+    stored = json.loads(_git(proposta_repo, "show", "main:data/pending.json"))
+    assert stored["a"]["status"] == "alert"
+    assert stored["a"]["proposal"]["folder"] == "2026-10-07-10-00-workana-app-a"
+    # The autostash put seen.json back, still dirty, for the workflow's Save state
+    assert _git(bot.PROPOSTA_DIR, "status", "--porcelain") == " M data/seen.json\n"
+
+
+def test_publish_proposal_logs_only_the_exit_code(proposta_repo, workdir, capsys) -> None:
+    _git(bot.PROPOSTA_DIR, "remote", "set-url", "origin", str(workdir / "sumiu.git"))
+    folder = _write_folder(AGENT_PROPOSAL)
+    bot.save_pending(
+        {
+            "a": _queued(
+                "a", "App a", bot.JobStatus.ALERT, description="descrição a", proposal=AGENT_PROPOSAL
+            )
+        }
+    )
+
+    assert bot.publish_proposal(folder.name) is False
+
+    err = capsys.readouterr().err
+    assert err.startswith("Proposta não publicada: git pull saiu com código ")
+    # One line, none of git's own output (it names the remote and the files)
+    assert err.count("\n") == 1
+    assert "sumiu" not in err and "fatal" not in err
+    # The commit stays in the clone, for the workflow's Save state to push
+    assert _git(bot.PROPOSTA_DIR, "log", "-1", "--format=%s") == (
+        "chore: add workana proposal 2026-10-07-10-00-workana-app-a\n"
+    )
+
+
+def test_publish_proposal_needs_proposta_clone(workdir, monkeypatch, capsys) -> None:
+    # Without its own .git, `git -C proposta` would commit to an enclosing repo
+    monkeypatch.setattr(bot.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("ran git"))
+
+    assert bot.publish_proposal(AGENT_PROPOSAL.folder) is False
+
+    assert "proposta/ não é um clone do git" in capsys.readouterr().err
 
 
 def test_check_fit_uses_fit_prompt_file(workdir, monkeypatch) -> None:
