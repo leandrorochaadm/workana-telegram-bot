@@ -1,5 +1,7 @@
 import json
+import subprocess
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +66,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "PENDING_FILE", data / "pending.json")
     monkeypatch.setattr(bot, "REJECTED_FILE", data / "rejected.json")
     monkeypatch.setattr(bot, "FIT_PROMPT_FILE", fit_prompt)
+    monkeypatch.setattr(bot, "GENERATED_DIR", proposta / "generated")
     monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
     for var in (
         "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
@@ -544,6 +547,10 @@ def test_call_claude_runs_print_mode_without_api_key(monkeypatch) -> None:
     env = calls[0]["env"]
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
     assert "ANTHROPIC_API_KEY" not in env
+    # A plain answer: no agent flags, outside the repo
+    for flag in ("--allowedTools", "--add-dir", "--permission-mode", "--append-system-prompt"):
+        assert flag not in cmd
+    assert calls[0]["cwd"] == bot.tempfile.gettempdir()
 
 
 def test_call_claude_raises_on_cli_failure(monkeypatch) -> None:
@@ -569,6 +576,206 @@ def test_call_claude_raises_without_structured_output(monkeypatch) -> None:
 
     with pytest.raises(bot.ProposalError, match="subtype=error_max_turns"):
         _call_claude()
+
+
+SKILL_TEXT = "# proposta-freela de teste\nSiga os Passos 1 a 5."
+AGENT_FILES = {bot.PROPOSAL_FILE: "Proposta.", bot.ANALYSIS_FILE: "Análise."}
+AGENT_SUMMARY = {"price": "R$ 6 000", "deadline": "1 dia + 3 semanas"}
+
+
+@pytest.fixture
+def skill(workdir, monkeypatch):
+    """The skill as on the runner: a ~/.claude/skills symlink into the dotfiles checkout."""
+    target = workdir / "dotfiles" / ".claude" / "skills" / "proposta-freela"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text(SKILL_TEXT)
+    link = workdir / "home" / ".claude" / "skills" / "proposta-freela"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    monkeypatch.setattr(bot, "SKILL_DIR", link)
+    monkeypatch.setattr(bot, "SKILL_FILE", link / "SKILL.md")
+    return target
+
+
+def _fake_agent(
+    monkeypatch,
+    files: dict[str, str] | None = None,
+    returncode: int = 0,
+    error: Exception | None = None,
+) -> list[dict]:
+    """Fakes the agent: writes `files` (AGENT_FILES by default) in its cwd, then answers
+    AGENT_SUMMARY or raises `error`."""
+    written = AGENT_FILES if files is None else files
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, **kwargs})
+        for name, text in written.items():
+            (kwargs["cwd"] / name).write_text(text)
+        if error is not None:
+            raise error
+        return SimpleNamespace(
+            returncode=returncode, stdout=json.dumps({"structured_output": AGENT_SUMMARY})
+        )
+
+    monkeypatch.setattr(bot.subprocess, "run", fake_run)
+    return calls
+
+
+def _flag(cmd: list[str], name: str) -> str:
+    return cmd[cmd.index(name) + 1]
+
+
+def _flag_values(cmd: list[str], name: str) -> list[str]:
+    """The values of a flag that takes a list: everything up to the next flag."""
+    start = cmd.index(name) + 1
+    end = next((i for i in range(start, len(cmd)) if cmd[i].startswith("--")), len(cmd))
+    return cmd[start:end]
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("App de Agendamento — Clínica Estética!", "app-de-agendamento-clinica-estetica"),
+        ("  Ação: São João / iOS & Android  ", "acao-sao-joao-ios-android"),
+        ("", "vaga"),
+        ("!!! ???", "vaga"),
+        # Cut back to the last whole word under SLUG_MAX_CHARS
+        ("palavra " * 20, "-".join(["palavra"] * 7)),
+        # The hyphen right after the limit still counts as a word end
+        ("a" * 60 + " b", "a" * 60),
+        # A single word longer than the limit is cut at it
+        ("a" * 80, "a" * 60),
+    ],
+)
+def test_proposal_slug(title: str, expected: str) -> None:
+    slug = bot.proposal_slug(title)
+
+    assert slug == expected
+    assert len(slug) <= bot.SLUG_MAX_CHARS
+    assert not slug.startswith("-") and not slug.endswith("-")
+
+
+def test_proposal_folder_uses_sao_paulo_time_and_suffix(workdir) -> None:
+    # 01:30 UTC is still the day before in Brasília (UTC-3)
+    now = datetime(2026, 10, 7, 1, 30, tzinfo=UTC)
+
+    first = bot.proposal_folder("App Novo", now)
+    assert first == bot.GENERATED_DIR / "2026-10-06-22-30-workana-app-novo"
+    # Only the path: generate_proposal creates the folder
+    assert not first.exists()
+
+    first.mkdir(parents=True)
+    second = bot.proposal_folder("App Novo", now)
+    assert second.name == "2026-10-06-22-30-workana-app-novo-2"
+    second.mkdir()
+    assert bot.proposal_folder("App Novo", now).name == "2026-10-06-22-30-workana-app-novo-3"
+
+
+def test_generate_proposal_runs_agent_with_restricted_tools(skill, monkeypatch) -> None:
+    calls = _fake_agent(monkeypatch)
+    project = _project("x", "App Novo")
+
+    proposal = bot.generate_proposal("oauth-tok", bot.SKILL_FILE.read_text(), project, "descrição")
+
+    folder = bot.GENERATED_DIR / proposal.folder
+    assert proposal == bot.Proposal(
+        folder=folder.name, price="R$ 6 000", deadline="1 dia + 3 semanas"
+    )
+    assert folder.name.endswith("-workana-app-novo")
+    assert (folder / bot.PROPOSAL_FILE).read_text() == "Proposta."
+    [call] = calls
+    cmd = call["cmd"]
+    assert cmd[:2] == ["claude", "-p"]
+    assert _flag(cmd, "--model") == "claude-sonnet-5-5"
+    assert _flag(cmd, "--effort") == "medium"
+    # The skill as it is, as the system prompt; the bot's rules only say how it runs
+    assert _flag(cmd, "--system-prompt") == SKILL_TEXT
+    instructions = _flag(cmd, "--append-system-prompt")
+    assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder)
+    assert str(folder) in instructions and "Pule o Passo 5" in instructions
+    assert _flag(cmd, "--tools") == "Read,Write,Edit,Bash"
+    home_skill = bot.SKILL_DIR.as_posix().lstrip("/")
+    real_skill = skill.resolve().as_posix().lstrip("/")
+    assert home_skill != real_skill
+    proposal_dir = folder.as_posix().lstrip("/")
+    assert _flag_values(cmd, "--allowedTools") == [
+        "Read(~/.claude/skills/proposta-freela/**)",
+        f"Read(//{home_skill}/**)",
+        f"Read(//{real_skill}/**)",
+        # Bash in the ~ form the skill writes, plus the symlink and its target: the agent
+        # expands ~ to the absolute path
+        "Bash(uv run ~/.claude/skills/proposta-freela/scripts/preco.py:*)",
+        "Bash(uv run ~/.claude/skills/proposta-freela/scripts/varredura.py:*)",
+        f"Bash(uv run /{home_skill}/scripts/preco.py:*)",
+        f"Bash(uv run /{home_skill}/scripts/varredura.py:*)",
+        f"Bash(uv run /{real_skill}/scripts/preco.py:*)",
+        f"Bash(uv run /{real_skill}/scripts/varredura.py:*)",
+        f"Read(//{proposal_dir}/**)",
+        f"Write(//{proposal_dir}/**)",
+        f"Edit(//{proposal_dir}/**)",
+        "Bash(date:*)",
+    ]
+    # The skill is the only extra dir: the folder is the cwd
+    assert _flag_values(cmd, "--add-dir") == [str(bot.SKILL_DIR)]
+    assert cmd.count("--add-dir") == 1
+    assert _flag(cmd, "--permission-mode") == "dontAsk"
+    assert _flag(cmd, "--setting-sources") == ""
+    assert "--no-session-persistence" in cmd
+    assert _flag(cmd, "--output-format") == "json"
+    assert json.loads(_flag(cmd, "--json-schema")) == bot.ProposalSummary.model_json_schema()
+    assert call["cwd"] == folder
+    assert call["timeout"] == bot.PROPOSAL_TIMEOUT_SECONDS
+    assert call["input"] == bot.job_content(project, "descrição")
+
+
+def test_agent_runs_with_minimal_env(skill, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/runner")
+    monkeypatch.setenv("UV_CACHE_DIR", "/home/runner/.cache/uv")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-environ")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "telegram-secret")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    calls = _fake_agent(monkeypatch)
+
+    bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    env = calls[0]["env"]
+    assert {k for k in env if not k.startswith(bot.UV_ENV_PREFIX)} <= set(bot.AGENT_ENV_KEYS)
+    assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert env["HOME"] == "/home/runner"
+    assert env["UV_CACHE_DIR"] == "/home/runner/.cache/uv"
+    # The token given wins over one already in the environment
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
+    assert not any(k.startswith("TELEGRAM_") for k in env)
+    assert "ANTHROPIC_API_KEY" not in env and "GITHUB_TOKEN" not in env
+
+
+@pytest.mark.parametrize(
+    ("files", "returncode", "error", "match"),
+    [
+        ({}, 0, None, "não gravou"),
+        ({bot.PROPOSAL_FILE: "Proposta."}, 0, None, "não gravou"),
+        ({bot.PROPOSAL_FILE: "Proposta.", bot.ANALYSIS_FILE: " \n"}, 0, None, "não gravou"),
+        (None, 1, None, "código 1"),
+        (None, 0, subprocess.TimeoutExpired("claude", 1200), None),
+    ],
+    ids=["no-files", "only-proposal", "blank-analysis", "cli-error", "timeout"],
+)
+def test_generate_proposal_cleans_folder_on_failure(
+    skill, monkeypatch, files, returncode, error, match
+) -> None:
+    _fake_agent(monkeypatch, files=files, returncode=returncode, error=error)
+    expected = bot.ProposalError if error is None else subprocess.TimeoutExpired
+
+    with pytest.raises(expected, match=match):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    # The run's folder is gone, with whatever the agent left in it
+    assert bot.GENERATED_DIR.is_dir()
+    assert list(bot.GENERATED_DIR.iterdir()) == []
 
 
 def test_check_fit_uses_fit_prompt_file(workdir, monkeypatch) -> None:
