@@ -49,12 +49,26 @@ def test_matches_keywords_empty_list_matches_nothing() -> None:
     assert bot.matches_keywords("App de jogo", []) is False
 
 
+# Ends without a newline on purpose: the fixture adds one, as a text file has
+FIT_PROMPT_TEXT = "Critério de triagem de teste.\nResponda só sim ou não."
+
+
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
+    # Same layout as the proposta checkout next to bot.py on the runner
+    proposta = tmp_path / "proposta"
+    data = proposta / "data"
+    data.mkdir(parents=True)
+    fit_prompt = proposta / "prompts" / "fit_prompt.md"
+    fit_prompt.parent.mkdir()
+    fit_prompt.write_text(FIT_PROMPT_TEXT + "\n")
     monkeypatch.setattr(bot, "ENV_FILE", tmp_path / ".env")
-    monkeypatch.setattr(bot, "SEEN_FILE", tmp_path / "seen.json")
-    monkeypatch.setattr(bot, "PENDING_FILE", tmp_path / "pending.json")
-    monkeypatch.setattr(bot, "REJECTED_FILE", tmp_path / "rejected.json")
+    monkeypatch.setattr(bot, "PROPOSTA_DIR", proposta)
+    monkeypatch.setattr(bot, "DATA_DIR", data)
+    monkeypatch.setattr(bot, "SEEN_FILE", data / "seen.json")
+    monkeypatch.setattr(bot, "PENDING_FILE", data / "pending.json")
+    monkeypatch.setattr(bot, "REJECTED_FILE", data / "rejected.json")
+    monkeypatch.setattr(bot, "FIT_PROMPT_FILE", fit_prompt)
     monkeypatch.setattr(bot, "PROMPT_FILE", tmp_path / "proposal_prompt.enc")
     monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
     for var in (
@@ -80,6 +94,14 @@ def test_seen_roundtrip(workdir) -> None:
     assert bot.load_seen() == set()
     bot.save_seen({"b", "a"})
     assert bot.load_seen() == {"a", "b"}
+
+
+def test_load_fit_prompt_is_none_when_missing_or_blank(workdir) -> None:
+    assert bot.load_fit_prompt() == FIT_PROMPT_TEXT
+    bot.FIT_PROMPT_FILE.write_text(" \n\n")
+    assert bot.load_fit_prompt() is None
+    bot.FIT_PROMPT_FILE.unlink()
+    assert bot.load_fit_prompt() is None
 
 
 def _project(pid: str, title: str) -> dict[str, str]:
@@ -193,6 +215,24 @@ def test_main_exits_without_keywords(workdir) -> None:
     assert exc.value.code == 1
 
 
+def test_exits_without_data_dir(workdir, sent, monkeypatch, capsys) -> None:
+    bot.DATA_DIR.rmdir()
+
+    def fetch_without_state() -> list[dict[str, str]]:
+        raise AssertionError("read Workana without the state checkout")
+
+    monkeypatch.setattr(bot, "fetch_projects", fetch_without_state)
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main()
+
+    assert exc.value.code == 1
+    assert sent == []
+    assert "proposta/data" in capsys.readouterr().err
+    # Nothing recreated it: a run without the checkout must not start a fresh seen.json
+    assert not bot.DATA_DIR.exists()
+
+
 PROPOSAL = bot.Proposal(
     proposal="Olá! Proposta <texto>",
     price="R$ 4.800",
@@ -228,7 +268,8 @@ def with_proposals(workdir, monkeypatch):
             raise ValueError("saída do modelo com texto sigiloso")
         return PROPOSAL
 
-    def fake_check_fit(_token, project, _description):
+    def fake_check_fit(_token, fit_prompt, project, _description):
+        assert fit_prompt == FIT_PROMPT_TEXT
         if "logo" in project["title"]:
             return bot.JobFit(is_match=False)
         if "triagem" in project["title"]:
@@ -442,6 +483,28 @@ def test_main_skips_proposals_without_claude_cli(with_proposals, sent, monkeypat
     assert with_proposals == []
     assert len(sent) == 1
     assert "Claude Code não instalado" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("content", [None, " \n"])
+def test_main_alerts_only_without_fit_prompt(
+    with_proposals, sent, monkeypatch, capsys, content
+) -> None:
+    if content is None:
+        bot.FIT_PROMPT_FILE.unlink()
+    else:
+        bot.FIT_PROMPT_FILE.write_text(content)
+    fit_calls: list[tuple] = []
+    monkeypatch.setattr(bot, "check_fit", lambda *args: fit_calls.append(args))
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+
+    bot.main()
+
+    assert fit_calls == []
+    assert with_proposals == []
+    assert len(sent) == 1
+    assert "App novo" in sent[0]
+    assert "fit_prompt.md" in capsys.readouterr().err
+    assert "x" in bot.load_seen()
 
 
 def test_main_logs_proposal_error_details(with_proposals, sent, monkeypatch, capsys) -> None:
@@ -695,18 +758,19 @@ def test_generate_proposal_sends_prompt_and_job(monkeypatch, rates) -> None:
     assert "ANTHROPIC_API_KEY" not in env
 
 
-def test_check_fit_asks_haiku_with_job(monkeypatch) -> None:
+def test_check_fit_uses_fit_prompt_file(workdir, monkeypatch) -> None:
     calls = _fake_claude(
         monkeypatch, output={"structured_output": {"is_match": False}}
     )
 
-    fit = bot.check_fit("tok", _project("x", "Site novo"), "descrição")
+    fit = bot.check_fit("tok", bot.load_fit_prompt(), _project("x", "Site novo"), "descrição")
 
     assert fit == bot.JobFit(is_match=False)
     cmd = calls[0]["cmd"]
     assert cmd[cmd.index("--model") + 1] == bot.FIT_MODEL
     assert "--effort" not in cmd
-    assert cmd[cmd.index("--system-prompt") + 1] == bot.FIT_PROMPT
+    # The file's text without its trailing newline, as the old literal was
+    assert cmd[cmd.index("--system-prompt") + 1] == FIT_PROMPT_TEXT
     assert json.loads(cmd[cmd.index("--json-schema") + 1]) == bot.JobFit.model_json_schema()
     assert "Site novo" in calls[0]["input"] and "descrição" in calls[0]["input"]
     assert calls[0]["timeout"] == bot.FIT_TIMEOUT_SECONDS

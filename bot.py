@@ -36,13 +36,19 @@ import varredura
 
 BASE_DIR = Path(__file__).parent
 ENV_FILE = BASE_DIR / ".env"
-SEEN_FILE = BASE_DIR / "seen.json"
+# Checkout of the private repo leandrorochaadm/proposta: state and triage prompt stay
+# out of this public repo
+PROPOSTA_DIR = BASE_DIR / "proposta"
+DATA_DIR = PROPOSTA_DIR / "data"
+SEEN_FILE = DATA_DIR / "seen.json"
 # Matched jobs still waiting for a proposal: {id: {"title", "url", "attempts"}}, plus
 # "unsent_proposal" when the alert went out but the proposal message did not: the
 # message encrypted with PROMPT_KEY, since the repo is public
-PENDING_FILE = BASE_DIR / "pending.json"
-# Jobs the triage turned down, kept to tune FIT_PROMPT: {id: {"title", "url", "date"}}
-REJECTED_FILE = BASE_DIR / "rejected.json"
+PENDING_FILE = DATA_DIR / "pending.json"
+# Jobs the triage turned down, kept to tune the triage prompt: {id: {"title", "url", "date"}}
+REJECTED_FILE = DATA_DIR / "rejected.json"
+# What the developer takes and turns down; read on every run, so editing it needs no deploy
+FIT_PROMPT_FILE = PROPOSTA_DIR / "prompts" / "fit_prompt.md"
 # Encrypted because the repo is public and the prompt holds private pricing rules
 PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
 # Listing that timed out (screenshot + HTML), uploaded by the workflow
@@ -69,24 +75,6 @@ PROPOSAL_EFFORT = "medium"
 # Cheap first pass so the Opus call is spent only on jobs that fit the work offered
 FIT_MODEL = "claude-haiku-4-5-20251001"
 FIT_TIMEOUT_SECONDS = 60
-FIT_PROMPT = """Você faz a triagem de vagas da Workana para um desenvolvedor freelancer.
-Ele aceita vagas para desenvolver software com telas: aplicativo mobile (Android, iOS,
-multiplataforma) ou sistema web (SaaS, painel, plataforma, área logada), do zero ou evoluindo
-um que já existe em Flutter (ver abaixo).
-
-Ele não aceita: landing page, site institucional, blog, loja montada em plataforma pronta
-(Shopify, WordPress, Wix, Nuvemshop), só design ou protótipo (UI/UX, Figma), bot, automação,
-integração ou scraping sem telas, planilha, tráfego pago, marketing, conteúdo, vídeo, suporte
-de TI, vaga de emprego fixo ou revenda de app pronto. Também não aceita aplicativo ou sistema
-feito só para publicar ou agendar posts em redes sociais (Instagram, Facebook, TikTok, LinkedIn).
-
-Ele também não aceita terminar, continuar, corrigir ou dar manutenção num aplicativo ou sistema
-web que já existe e não foi feito em Flutter (React Native, Ionic, Kotlin, Java, Swift, Xamarin,
-.NET MAUI, FlutterFlow, React, Angular, Vue, Next.js, PHP, Laravel, Django, Bubble ou outra
-ferramenta). App ou sistema existente em Flutter, ou sem a tecnologia informada, segue valendo.
-
-Leia a vaga e responda só sim ou não: ela dá match? Na dúvida, quando a vaga pode ser um app
-ou sistema com telas, responda sim."""
 # Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
 MAX_PROPOSALS_PER_RUN = 5
 # Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
@@ -310,6 +298,14 @@ def load_rejected() -> dict[str, dict]:
 
 def save_rejected(rejected: dict[str, dict]) -> None:
     REJECTED_FILE.write_text(json.dumps(rejected, ensure_ascii=False, indent=2))
+
+
+def load_fit_prompt() -> str | None:
+    """The triage criteria from the proposta checkout; None when missing or blank."""
+    if not FIT_PROMPT_FILE.exists():
+        return None
+    # The file ends in a newline the old literal did not have
+    return FIT_PROMPT_FILE.read_text().strip() or None
 
 
 @contextmanager
@@ -639,11 +635,13 @@ def job_content(project: dict[str, str], description: str) -> str:
     return f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n{description}\n</vaga>"
 
 
-def check_fit(oauth_token: str, project: dict[str, str], description: str) -> JobFit:
+def check_fit(
+    oauth_token: str, fit_prompt: str, project: dict[str, str], description: str
+) -> JobFit:
     """Asks Haiku whether the job is an app or web system, before the Opus proposal."""
     output = call_claude(
         oauth_token,
-        FIT_PROMPT,
+        fit_prompt,
         job_content(project, description),
         model=FIT_MODEL,
         schema=JobFit,
@@ -898,9 +896,17 @@ def main() -> None:
     if not keywords:
         print("Nenhuma keyword configurada em KEYWORDS no .env", file=sys.stderr)
         sys.exit(1)
+    if not DATA_DIR.is_dir():
+        # Without seen.json every job in the listing would be alerted again
+        print(
+            "Pasta proposta/data não encontrada: o checkout do repositório proposta falhou",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     prompt_key = env.get("PROMPT_KEY") or os.environ.get("PROMPT_KEY")
+    fit_prompt = load_fit_prompt()
     system = None
     if oauth_token and prompt_key and PROMPT_FILE.exists():
         pricing_ok = configure_pricing(
@@ -908,6 +914,12 @@ def main() -> None:
         )
         if not pricing_ok:
             print("Falta PRICE_HOURLY_RATE válido, seguindo sem propostas", file=sys.stderr)
+        elif fit_prompt is None:
+            # Proposals without the triage would bill Opus for every keyword match
+            print(
+                "Falta proposta/prompts/fit_prompt.md, seguindo sem triagem nem propostas",
+                file=sys.stderr,
+            )
         elif shutil.which("claude") is None:
             print("Claude Code não instalado, seguindo sem propostas", file=sys.stderr)
         else:
@@ -987,7 +999,7 @@ def main() -> None:
                     continue
                 try:
                     description = fetch_description(project["url"])
-                    off_profile = not triage(oauth_token, project, description)
+                    off_profile = not triage(oauth_token, fit_prompt, project, description)
                     if not off_profile:
                         proposals_left -= 1
                         proposal = generate_proposal(
@@ -1064,13 +1076,15 @@ def main() -> None:
         sys.exit(1)
 
 
-def triage(oauth_token: str, project: dict[str, str], description: str) -> bool:
+def triage(
+    oauth_token: str, fit_prompt: str, project: dict[str, str], description: str
+) -> bool:
     """Whether the job deserves a proposal.
 
     Fails open: a triage error must not cost a job that could fit.
     """
     try:
-        return check_fit(oauth_token, project, description).is_match
+        return check_fit(oauth_token, fit_prompt, project, description).is_match
     except Exception as exc:  # noqa: BLE001
         # Same rule as the proposal: only ProposalError is safe for the public logs
         detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
