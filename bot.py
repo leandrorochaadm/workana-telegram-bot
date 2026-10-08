@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "cryptography",
 #   "playwright==1.63.0",
 #   "pydantic",
 #   "requests",
@@ -12,7 +11,6 @@
 
 import html
 import json
-import math
 import os
 import re
 import shutil
@@ -21,18 +19,14 @@ import sys
 import tempfile
 import time
 from datetime import UTC, datetime
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 import requests
-from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
-
-import preco
-import varredura
 
 BASE_DIR = Path(__file__).parent
 ENV_FILE = BASE_DIR / ".env"
@@ -41,16 +35,12 @@ ENV_FILE = BASE_DIR / ".env"
 PROPOSTA_DIR = BASE_DIR / "proposta"
 DATA_DIR = PROPOSTA_DIR / "data"
 SEEN_FILE = DATA_DIR / "seen.json"
-# Matched jobs still waiting for a proposal: {id: {"title", "url", "attempts"}}, plus
-# "unsent_proposal" when the alert went out but the proposal message did not: the
-# message encrypted with PROMPT_KEY, since the repo is public
+# Matched jobs not alerted yet: {id: {"title", "url", "attempts"}}
 PENDING_FILE = DATA_DIR / "pending.json"
 # Jobs the triage turned down, kept to tune the triage prompt: {id: {"title", "url", "date"}}
 REJECTED_FILE = DATA_DIR / "rejected.json"
 # What the developer takes and turns down; read on every run, so editing it needs no deploy
 FIT_PROMPT_FILE = PROPOSTA_DIR / "prompts" / "fit_prompt.md"
-# Encrypted because the repo is public and the prompt holds private pricing rules
-PROMPT_FILE = BASE_DIR / "proposal_prompt.enc"
 # Listing that timed out (screenshot + HTML), uploaded by the workflow
 # to tell a Cloudflare block from a layout change
 DEBUG_DIR = BASE_DIR / "debug"
@@ -70,192 +60,31 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-PROPOSAL_MODEL = "claude-opus-5-5"
-PROPOSAL_EFFORT = "medium"
-# Cheap first pass so the Opus call is spent only on jobs that fit the work offered
+# Cheap yes-or-no pass: only jobs that fit the work offered go on
 FIT_MODEL = "claude-haiku-4-5-20251001"
 FIT_TIMEOUT_SECONDS = 60
-# Keeps a burst of new jobs from blowing the workflow timeout and the Max usage limit
-MAX_PROPOSALS_PER_RUN = 5
-# Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
-# connecting WARP, the deadline below, then one last job (page + Haiku triage + one
-# Opus call) and the commit.
-# Revisions only start before the deadline, so they never add a call past it.
-PROPOSAL_TIMEOUT_SECONDS = 180
 PAGE_TIMEOUT_MS = 30_000
+# Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
+# connecting WARP, the deadline below, then one last job (page + Haiku triage) and
+# the commit
 PROPOSAL_DEADLINE_SECONDS = 5 * 60
-# A job that keeps failing (refusal, page gone) is sent without a proposal after
-# this many tries, so it cannot bill every run forever
+# A job whose page keeps failing is sent without a proposal after this many tries,
+# so it cannot cost a page load every run forever
 MAX_PROPOSAL_ATTEMPTS = 3
-# Extra Claude calls per proposal to remove what the scan flagged as an error
-MAX_REVISIONS = 1
 TELEGRAM_MAX_CHARS = 4096
-# A proposal longer than one message goes out split in up to this many
-PROPOSAL_MAX_MESSAGES = 2
-# Covers a short Telegram hiccup without leaving the alert alone in the chat
+# Covers a short Telegram hiccup before the job waits for the next run
 TELEGRAM_SEND_ATTEMPTS = 3
 TELEGRAM_RETRY_SECONDS = 2
-# The proposal goes out alone, after the alert, so it can be copied straight to the
-# client; what goes over one Telegram message is split, never revised or trimmed.
-# These replace varredura.py's 600-800 word range
-PROPOSAL_MIN_CHARS = 3890
-# The prompt's ceiling, just under the limit: the message uses all of it
-PROPOSAL_TARGET_CHARS = 4090
-# Average of the skill's own texts, space included
-CHARS_PER_WORD = 5.6
-# Only a guide for Claude, which estimates words far better than characters: at
-# CHARS_PER_WORD, plus the greeting, this range lands inside the target
-PROPOSAL_WORDS_HINT = (670, 695)
-# Asked on top of the overflow, since Claude cuts by eye and tends to fall short
-REVISION_MARGIN_CHARS = 150
 
 
 class ProposalError(Exception):
     """A failure whose message is safe for public logs: it never holds model output."""
 
 
-class ProposalTooLong(ProposalError):
-    """The proposal does not fit PROPOSAL_MAX_MESSAGES Telegram messages."""
-
-
 class JobFit(BaseModel):
     """The Haiku triage answer: whether the job is worth a proposal."""
 
     is_match: bool
-
-
-class ProposalDraft(BaseModel):
-    """What the model returns: the text with price and hour placeholders, plus the estimate."""
-
-    proposal: str
-    dev_hours: int
-    # Parts of dev_hours shown as steps; the tests step takes the rest, rounding included
-    build_hours: int
-    backend_hours: int
-    store_hours: int
-    screens: int
-    notes: str
-
-
-class Proposal(BaseModel):
-    proposal: str
-    price: str
-    deadline: str
-    negotiation_floor: str
-    notes: str
-    # varredura.py findings on the final text, for a manual fix before pasting
-    review: list[str] = []
-
-
-# The model estimates hours and writes these markers; preco.py does the arithmetic,
-# since the model gets it wrong and the rates stay out of the prompt
-PRICE_PLACEHOLDERS = ("{{PRECO}}", "{{PRAZO}}", "{{COBRANCA}}", "{{REGUA}}")
-# The six steps of the proposal, in the skill's order, plus their sum. A step with
-# no hours leaves the text, so its marker must be absent
-HOUR_PLACEHOLDERS = (
-    "{{HORAS_PAPEL}}",
-    "{{HORAS_DESENHO}}",
-    "{{HORAS_CONSTRUCAO}}",
-    "{{HORAS_BASTIDORES}}",
-    "{{HORAS_TESTES}}",
-    "{{HORAS_LOJA}}",
-    "{{HORAS_TOTAL}}",
-)
-# Fewest full hours a dev step can have and still show after preco.py's cut (3 at 0.35)
-MIN_STEP_HOURS = math.ceil(1 / preco.CORTE_DE_TEMPO)
-PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
-# Links are only a style alert for direct clients, but they get the Workana account suspended
-WORKANA_BLOCKING_RULES = ("endereço no texto",)
-REVIEW_EXCERPT_CHARS = 60
-# What Workana's filter blocks and varredura.py (written for direct clients) allows
-WORKANA_FORBIDDEN = (
-    (r"[\w.+-]+@[\w-]+\.[\w.]+", "e-mail no texto"),
-    (r"\(?\b\d{2}\)?[\s.-]?9?\d{4}[\s.-]?\d{4}\b", "telefone no texto"),
-    (r"\b[\w-]+(\.[\w-]+)*\.(com|net|org|dev|app|io|me|site|br)\b", "endereço de site no texto"),
-    (
-        # Narrow on purpose: "call center", "app de reuniões" or "login com Facebook"
-        # can be the client's own scope
-        r"\b((fazer|marcar|marcamos|uma|numa|em) (call|reuni[ãa]o|chamada)|v[íi]deo ?chamada|"
-        r"chamada de v[íi]deo|conversar por v[íi]deo|me chama|me chame|entr(e|ar) em contato|"
-        r"fal(a|e|ar) comigo|skype|zoom|google meet|me (segue|siga|encontra|acha) n[oa])\b",
-        "convite para conversa ou rede social",
-    ),
-)
-# Wording the scan flags as an error, spelled out in the prompt so the first draft
-# avoids it and the scan stays a safety net. test_bot keeps it in sync with the scan
-FORBIDDEN_WORDING = (
-    (
-        "Conectores com cara de IA",
-        (
-            "além disso", "portanto", "dessa forma", "desta forma", "em suma", "vale ressaltar",
-            "é importante notar", "é importante destacar", "é importante ressaltar",
-            "não apenas X, mas também Y", "no mundo de hoje", "solução robusta", "por fim",
-            "ademais", "sendo assim",
-        ),
-    ),
-    (
-        "Palavras vetadas, em qualquer forma",
-        (
-            "taxa", "taxas", "WhatsApp", "whats", "zap", "comissão", "comissionamento", "Pix",
-            "ligar", "ligo", "ligue", "liguei", "ligamos", "ligando", "ligaremos", "ligarei",
-        ),
-    ),
-    (
-        "Promessas de exclusividade",
-        (
-            "só no seu projeto", "só ao seu projeto", "dedicação exclusiva", "exclusivamente no seu",
-            "sem dividir com outro", "não pego outro projeto", "não pego outro cliente",
-            "um projeto por vez", "um cliente por vez",
-        ),
-    ),
-    (
-        "Convites para conversa fora da Workana",
-        (
-            "fazer uma call", "marcar uma reunião", "numa chamada", "videochamada",
-            "chamada de vídeo", "conversar por vídeo", "me chama", "me chame", "entre em contato",
-            "fale comigo", "Skype", "Zoom", "Google Meet", "me segue no",
-        ),
-    ),
-)
-FORBIDDEN_RULES = (
-    "Sem travessão (—) nem meia risca (–): use vírgula, dois-pontos ou ponto.",
-    "Sem emoji, negrito ou itálico (nada de * ou **).",
-    "Sem e-mail, telefone, link, domínio (.com, .br, .app...), GitHub ou Behance.",
-    "Sem número de telas ou de funcionalidades (ex.: \"8 telas\", \"três funcionalidades\").",
-    "Horas só as das etapas, pelos marcadores, e o prazo de resposta (\"respondo em até duas "
-    "horas\"); nenhuma outra conta de horas, nem horas por semana.",
-    "Cada parágrafo numa linha só, com uma linha em branco entre eles, sem título, marcador nem "
-    "lista numerada.",
-    "O primeiro parágrafo é o cumprimento fixo, literal e sozinho. Ele é a única exceção aos "
-    "convites acima: o \"é só me chamar\" dele fica como está.",
-    "A frase do pagamento que diz que algo é cobrado depois da entrega nomeia a entrada no "
-    "mesmo parágrafo.",
-    "A promessa de versão toda semana ou toda sexta vem ancorada na mesma frase: \"Dentro da "
-    "fase, toda semana...\" ou \"depois que você aprovar\".",
-    "Não prometa acesso, senha ou credencial ao cliente desde o começo ou durante o projeto, "
-    "e não explique quando os acessos são entregues.",
-    f"Tamanho: o texto inteiro, já com preço e horas, tem entre {PROPOSAL_MIN_CHARS} e "
-    f"{PROPOSAL_TARGET_CHARS} caracteres contando espaços, para caber numa mensagem só. "
-    "A faixa é estreita: mire no meio dela, sem passar do teto. Como "
-    f"referência, isso dá cerca de {PROPOSAL_WORDS_HINT[0]} a {PROPOSAL_WORDS_HINT[1]} palavras "
-    "depois do cumprimento. Esta faixa vence qualquer outra faixa de tamanho do sistema. "
-    "Para caber, encurte o porquê de cada etapa e junte frases, sem tirar etapa, preço, prazo "
-    "ou pergunta.",
-)
-
-
-def forbidden_wording_prompt() -> str:
-    """The scan's error rules as a prompt section, so Claude skips them up front."""
-    lines = [
-        "<proibicoes>",
-        "Uma varredura automática reprova a proposta que tiver qualquer item abaixo. "
-        "Não use nenhum deles, nem em outra forma ou flexão.",
-    ]
-    for title, terms in FORBIDDEN_WORDING:
-        lines.append(f"- {title}: " + "; ".join(f'"{term}"' for term in terms) + ".")
-    lines.extend(f"- {rule}" for rule in FORBIDDEN_RULES)
-    lines.append("</proibicoes>")
-    return "\n".join(lines)
 
 
 def load_env() -> dict[str, str]:
@@ -400,237 +229,6 @@ def fetch_description(url: str) -> str:
         return page.inner_text(".block-detail").strip()
 
 
-def configure_pricing(hourly_rate: str | None) -> bool:
-    """Loads the private hourly rate into preco.py; False when it is missing or invalid.
-
-    The project minimum stays at zero: the bot prices every job, however small.
-    """
-    try:
-        rate = float(hourly_rate or "")
-    except ValueError:
-        return False
-    if rate <= 0:
-        return False
-    preco.VALOR_HORA = rate
-    return True
-
-
-def client_deadline(r: preco.Resultado) -> str:
-    """The deadline as the client reads it, opening its own sentence with both units spelled out."""
-    days, weeks = r.dias_fase_1, r.fases - 1
-    days_text = "É um dia" if days == 1 else f"São {preco.extenso_masculino(days)} dias"
-    weeks_text = "uma semana" if weeks == 1 else f"{preco.extenso(weeks)} semanas"
-    return f"{days_text} para fechar o projeto no papel e {weeks_text} de desenvolvimento"
-
-
-def workana_findings(text: str) -> list[varredura.Achado]:
-    return [
-        varredura.Achado(
-            varredura.ERRO,
-            rule,
-            "A Workana barra contato e convite para conversa fora do texto, e suspende a conta. "
-            "Corte o trecho; a prova do trabalho é o vídeo em anexo ou o nome do app na loja.",
-            varredura.contexto(text, pattern),
-        )
-        for pattern, rule in WORKANA_FORBIDDEN
-        if re.search(pattern, text, re.IGNORECASE)
-    ]
-
-
-def size_findings(text: str) -> list[varredura.Achado]:
-    """The floor of the size range; the ceiling is Telegram's limit, checked apart."""
-    findings = []
-    units = utf16_len(text)
-    if units < PROPOSAL_MIN_CHARS:
-        findings.append(
-            varredura.Achado(
-                varredura.ALERTA,
-                f"abaixo de {PROPOSAL_MIN_CHARS} caracteres",
-                f"{units} caracteres. Abaixo da faixa alguma coisa foi cortada, quase sempre uma "
-                "etapa do trabalho. Exceção: vaga vaga demais para orçar.",
-            )
-        )
-    return findings
-
-
-# varredura.py's word range, replaced by size_findings
-SKIPPED_SCAN_RULES = (
-    f"abaixo de {varredura.PALAVRAS_MIN} palavras",
-    f"acima de {varredura.PALAVRAS_MAX} palavras",
-)
-
-
-def scan_proposal(text: str) -> list[varredura.Achado]:
-    """varredura.py's text checks, adjusted for Workana, errors first."""
-    findings = workana_findings(varredura.desdobra(text)) + size_findings(text)
-    for finding in varredura.varre(text, None):
-        if finding.regra in SKIPPED_SCAN_RULES:
-            continue
-        if finding.regra.startswith(WORKANA_BLOCKING_RULES):
-            finding.nivel = varredura.ERRO
-        findings.append(finding)
-    return sorted(findings, key=lambda finding: finding.nivel != varredura.ERRO)
-
-
-def review_proposal(text: str) -> list[str]:
-    """The scan as short labels for the Telegram alert."""
-    labels = []
-    for finding in scan_proposal(text):
-        label = f"{'ERRO' if finding.nivel == varredura.ERRO else 'alerta'}: {finding.regra}"
-        if finding.trecho:
-            label += f" ({finding.trecho[:REVIEW_EXCERPT_CHARS].strip()})"
-        labels.append(label)
-    return labels
-
-
-def proposal_problems(draft: ProposalDraft) -> tuple[bool, list[str]]:
-    """Says if the draft can be priced, and lists what must leave the text for Claude."""
-    try:
-        proposal = price_proposal(draft)
-    except ProposalError as exc:
-        return False, [f"{exc}. Siga as regras dos marcadores de preço e de horas do sistema."]
-    problems = []
-    for finding in scan_proposal(proposal.proposal):
-        if finding.nivel != varredura.ERRO:
-            continue
-        problem = f"{finding.regra}: {finding.detalhe}"
-        if finding.trecho:
-            problem += f' Trecho: "{finding.trecho}"'
-        problems.append(problem)
-    # Too long is not a problem: the message is split instead.
-    # A job too vague to price gets the short version on purpose: no padding for it
-    if draft.dev_hours > 0 and (short := PROPOSAL_MIN_CHARS - utf16_len(proposal.proposal)) > 0:
-        add = short + REVISION_MARGIN_CHARS
-        problems.append(
-            f"proposta curta demais: tem {utf16_len(proposal.proposal)} caracteres, abaixo do "
-            f"piso de {PROPOSAL_MIN_CHARS}. Acrescente cerca de {add} caracteres, umas "
-            f"{math.ceil(add / CHARS_PER_WORD)} palavras, explicando melhor o porquê de cada "
-            f"etapa, sem passar de {PROPOSAL_TARGET_CHARS} caracteres."
-        )
-    return True, problems
-
-
-def fitting_proposal(draft: ProposalDraft) -> Proposal:
-    """Prices the draft, refusing one that would not fit PROPOSAL_MAX_MESSAGES messages."""
-    proposal = price_proposal(draft)
-    message = format_proposal(proposal)
-    if len(split_message(message)) > PROPOSAL_MAX_MESSAGES:
-        raise ProposalTooLong(
-            f"proposta não cabe em {PROPOSAL_MAX_MESSAGES} mensagens do Telegram "
-            f"({telegram_len(message)} caracteres)"
-        )
-    return proposal
-
-
-def revision_request(draft: ProposalDraft, problems: list[str]) -> str:
-    listed = "\n".join(f"- {problem}" for problem in problems)
-    return (
-        "\n\n<revisao>\n"
-        "Sua proposta anterior está em <proposta_anterior>. A varredura automática achou estes "
-        "problemas, e cada um precisa sair do texto:\n"
-        f"{listed}\n\n"
-        "Reescreva só o necessário para eliminar todos eles, mantendo o resto do texto, as regras "
-        "do sistema e os marcadores. Os trechos citados mostram o texto já com os marcadores "
-        "trocados pelos valores. Devolva o resultado completo, com as mesmas horas e telas, a não "
-        "ser que algum problema exija mudar.\n"
-        f"</revisao>\n\n<proposta_anterior>\n{draft.proposal}\n</proposta_anterior>"
-    )
-
-
-def price_proposal(draft: ProposalDraft) -> Proposal:
-    """Fills the draft's placeholders with preco.py's numbers and phrases."""
-    found = PLACEHOLDER_PATTERN.findall(draft.proposal)
-    markers = set(found)
-    if draft.dev_hours <= 0:
-        # Too vague to price: the proposal promises the number after the answers
-        if markers:
-            raise ProposalError("proposta sem estimativa, mas com marcador de preço")
-        return Proposal(
-            proposal=draft.proposal,
-            price="a definir após as respostas",
-            deadline="a definir",
-            negotiation_floor="a definir",
-            notes=draft.notes,
-            review=review_proposal(draft.proposal),
-        )
-    if draft.screens <= 0:
-        raise ProposalError(f"estimativa sem telas ({draft.dev_hours} h)")
-
-    r = preco.calcula(
-        horas_dev=draft.dev_hours, telas=draft.screens, etapas_cheias=full_step_hours(draft)
-    )
-    hours = step_hours(r)
-    expected = [*PRICE_PLACEHOLDERS, *(marker for marker, h in hours.items() if h > 0)]
-    # Each exactly once: a repeated marker would print the price twice
-    if sorted(found) != sorted(expected):
-        raise ProposalError(f"marcadores errados: {sorted(found)}, esperados {sorted(expected)}")
-
-    text = draft.proposal
-    for marker, value in zip(
-        PRICE_PLACEHOLDERS,
-        (preco.brl0(r.preco), client_deadline(r), preco.frase_da_cobranca(r), preco.frase_da_regua(r)),
-    ):
-        text = text.replace(marker, value)
-    for marker, h in hours.items():
-        text = text.replace(marker, str(h))
-
-    installments = r.parcelas
-    price = f"{preco.brl0(r.preco)}: entrada de {preco.brl0(installments[0].valor)}"
-    if len(installments) > 1:
-        price += f" e mais {len(installments) - 1} de {preco.brl0(installments[1].valor)}"
-    notes = [draft.notes.strip().rstrip(".")] if draft.notes.strip() else []
-    notes.append(
-        f"{r.horas_total} h no total, {r.horas_dev} de dev ({draft.dev_hours} antes do corte), "
-        f"{draft.screens} telas"
-    )
-    if r.fases - 1 > preco.SEMANAS_PROJETO_LONGO:
-        notes.append("projeto longo: considere propor só a primeira metade do escopo")
-    return Proposal(
-        proposal=text,
-        price=price,
-        deadline=preco.prazo_texto(r.fases, r.dias_fase_1),
-        negotiation_floor=preco.brl0(r.piso),
-        notes=". ".join(notes),
-        review=review_proposal(text),
-    )
-
-
-def full_step_hours(draft: ProposalDraft) -> list[int]:
-    """The draft's four dev steps before preco.py's time cut, in preco.ETAPAS_DE_DEV order.
-
-    The tests step takes whatever the other dev steps leave, which is where the skill
-    puts the rounding.
-    """
-    shown = draft.build_hours + draft.backend_hours + draft.store_hours
-    if min(draft.build_hours, draft.backend_hours, draft.store_hours) < 0:
-        raise ProposalError("horas por etapa negativas")
-    tests = draft.dev_hours - shown
-    if draft.build_hours <= 0 or tests <= 0:
-        raise ProposalError(
-            f"horas por etapa ({shown} h em construção, bastidores e loja) sem sobra para testes "
-            f"dentro de dev_hours ({draft.dev_hours} h)"
-        )
-    steps = [draft.build_hours, draft.backend_hours, tests, draft.store_hours]
-    # Below this the cut floors the step to zero, and its marker would be left over
-    small = [
-        f"{name} ({hours} h)"
-        for name, hours in zip(preco.ETAPAS_DE_DEV, steps)
-        if 0 < hours < MIN_STEP_HOURS
-    ]
-    if small:
-        raise ProposalError(
-            f"etapa com menos de {MIN_STEP_HOURS} horas cheias zera no corte: {', '.join(small)}. "
-            f"Use {MIN_STEP_HOURS} horas ou mais, ou 0 hora tirando a etapa do texto"
-        )
-    return steps
-
-
-def step_hours(r: preco.Resultado) -> dict[str, int]:
-    """Hours of each proposal step after the time cut, plus their sum, preco.py's total."""
-    steps = [hours for _, hours in r.etapas]
-    return dict(zip(HOUR_PLACEHOLDERS, (*steps, r.horas_total)))
-
-
 def job_content(project: dict[str, str], description: str) -> str:
     return f"<vaga>\nTítulo: {project['title']}\nLink: {project['url']}\n\n{description}\n</vaga>"
 
@@ -638,7 +236,7 @@ def job_content(project: dict[str, str], description: str) -> str:
 def check_fit(
     oauth_token: str, fit_prompt: str, project: dict[str, str], description: str
 ) -> JobFit:
-    """Asks Haiku whether the job is an app or web system, before the Opus proposal."""
+    """Asks Haiku whether the job is an app or web system, before any proposal work."""
     output = call_claude(
         oauth_token,
         fit_prompt,
@@ -648,67 +246,6 @@ def check_fit(
         timeout=FIT_TIMEOUT_SECONDS,
     )
     return JobFit.model_validate(output)
-
-
-def load_prompt(key: str) -> str:
-    return Fernet(key.encode()).decrypt(PROMPT_FILE.read_bytes()).decode()
-
-
-def generate_proposal(
-    oauth_token: str,
-    system: str,
-    project: dict[str, str],
-    description: str,
-    can_revise: Callable[[], bool] = lambda: True,
-) -> Proposal:
-    """Drafts the proposal, then asks Claude to fix what the scan flags, while time allows.
-
-    Scan errors left after the last revision still go out, listed in the alert. Length
-    is never revised: a proposal too long for one Telegram message goes out split, and
-    one that does not fit PROPOSAL_MAX_MESSAGES raises ProposalTooLong, and the alert
-    goes out saying so.
-    """
-    job = job_content(project, description)
-    draft = run_claude(oauth_token, system, job)
-    # The latest draft that could go out (right markers, fits the messages): a revision
-    # that breaks it, or a revision call that fails, must not throw it away
-    usable: Proposal | None = None
-    for _ in range(MAX_REVISIONS):
-        priceable, problems = proposal_problems(draft)
-        if not problems or not can_revise():
-            break
-        if priceable:
-            try:
-                usable = fitting_proposal(draft)
-            except ProposalError:
-                pass
-        try:
-            draft = run_claude(oauth_token, system, job + revision_request(draft, problems))
-        except Exception as exc:  # noqa: BLE001
-            if usable is None:
-                raise
-            detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
-            print(f"Revisão falhou, seguindo com a versão anterior: {detail}", file=sys.stderr)
-            return usable
-    try:
-        return fitting_proposal(draft)
-    except ProposalError:
-        if usable is None:
-            raise
-        return usable
-
-
-def run_claude(oauth_token: str, system: str, content: str) -> ProposalDraft:
-    output = call_claude(
-        oauth_token,
-        system,
-        content,
-        model=PROPOSAL_MODEL,
-        schema=ProposalDraft,
-        timeout=PROPOSAL_TIMEOUT_SECONDS,
-        effort=PROPOSAL_EFFORT,
-    )
-    return ProposalDraft.model_validate(output)
 
 
 def call_claude(
@@ -766,32 +303,11 @@ def call_claude(
     return output["structured_output"]
 
 
-def format_notification(
-    project: dict[str, str],
-    proposal: Proposal | None,
-    error: str | None,
-) -> str:
+def format_notification(project: dict[str, str], error: str | None) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
-    if proposal:
-        text += (
-            f"\n\n💰 <b>Preço:</b> {html.escape(proposal.price)}"
-            f"\n⏱ <b>Prazo:</b> {html.escape(proposal.deadline)}"
-            f"\n🔻 <b>Piso:</b> {html.escape(proposal.negotiation_floor)}"
-        )
-        if proposal.notes:
-            text += f"\n📝 {html.escape(proposal.notes)}"
-        if proposal.review:
-            text += "\n\n🔎 <b>Varredura:</b>" + "".join(
-                f"\n• {html.escape(item)}" for item in proposal.review
-            )
-    elif error:
+    if error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
-
-
-def format_proposal(proposal: Proposal) -> str:
-    """The proposal alone, with nothing around it, ready to paste to the client."""
-    return html.escape(proposal.proposal)
 
 
 def telegram_len(html_text: str) -> int:
@@ -868,19 +384,8 @@ def send_with_retry(token: str, chat_id: str, text: str) -> None:
             time.sleep(TELEGRAM_RETRY_SECONDS)
 
 
-def send_chunks(token: str, chat_id: str, chunks: list[str]) -> None:
-    """Sends each chunk, dropping it from the list once it goes out.
-
-    On a failure the list keeps only what did not go out, so it can be stored and sent
-    later without repeating the parts already in the chat.
-    """
-    while chunks:
-        send_with_retry(token, chat_id, chunks[0])
-        chunks.pop(0)
-
-
 def main() -> None:
-    # The proposal deadline counts from here: the listing scrape eats the same job timeout
+    # The triage deadline counts from here: the listing scrape eats the same job timeout
     started = time.monotonic()
     env = load_env()
     token = env.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
@@ -905,41 +410,21 @@ def main() -> None:
         sys.exit(1)
 
     oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    prompt_key = env.get("PROMPT_KEY") or os.environ.get("PROMPT_KEY")
     fit_prompt = load_fit_prompt()
-    system = None
-    if oauth_token and prompt_key and PROMPT_FILE.exists():
-        pricing_ok = configure_pricing(
-            env.get("PRICE_HOURLY_RATE") or os.environ.get("PRICE_HOURLY_RATE")
-        )
-        if not pricing_ok:
-            print("Falta PRICE_HOURLY_RATE válido, seguindo sem propostas", file=sys.stderr)
-        elif fit_prompt is None:
-            # Proposals without the triage would bill Opus for every keyword match
-            print(
-                "Falta proposta/prompts/fit_prompt.md, seguindo sem triagem nem propostas",
-                file=sys.stderr,
-            )
+    # Without any of the three every keyword match is alerted, as on a local run
+    can_triage = False
+    if oauth_token:
+        if fit_prompt is None:
+            print("Falta proposta/prompts/fit_prompt.md, seguindo sem triagem", file=sys.stderr)
         elif shutil.which("claude") is None:
-            print("Claude Code não instalado, seguindo sem propostas", file=sys.stderr)
+            print("Claude Code não instalado, seguindo sem triagem", file=sys.stderr)
         else:
-            try:
-                system = load_prompt(prompt_key) + "\n\n" + forbidden_wording_prompt()
-            except (InvalidToken, ValueError) as exc:
-                print(f"PROMPT_KEY inválida, seguindo sem propostas: {exc!r}", file=sys.stderr)
-    # Keeps an unsent proposal message private in pending.json
-    cipher = None
-    if prompt_key:
-        try:
-            cipher = Fernet(prompt_key.encode())
-        except ValueError:
-            pass
+            can_triage = True
 
     seen = load_seen()
     pending = load_pending()
     rejected = load_rejected()
     projects = fetch_projects()
-    proposals_left = MAX_PROPOSALS_PER_RUN
 
     def save_state() -> None:
         save_seen(seen)
@@ -967,69 +452,31 @@ def main() -> None:
     sent = failed = deferred = turned_down = 0
     try:
         for project in candidates:
-            if project.get("unsent_proposal"):
-                message = _decrypt(cipher, project["unsent_proposal"])
-                if message is not None:
-                    # The alert already went out: only the proposal is missing
-                    chunks = split_message(message)
-                    try:
-                        send_chunks(token, chat_id, chunks)
-                    except requests.RequestException as exc:
-                        failed += 1
-                        print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
-                        pending[project["id"]]["unsent_proposal"] = _encrypt(cipher, chunks)
-                        save_state()
-                        continue
-                    seen.add(project["id"])
-                    pending.pop(project["id"], None)
-                    save_state()
-                    sent += 1
-                    continue
-                # The key changed: a fresh proposal goes out, alert included
-                print(f"Proposta guardada ilegível em {project['url']}", file=sys.stderr)
-                project.pop("unsent_proposal")
-                pending[project["id"]] = _pending_entry(project)
-                save_state()
-            proposal = error = None
+            error = None
             off_profile = False
-            if system:
-                if proposals_left <= 0 or time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
-                    # Out of budget: stays pending instead of alerting without a proposal
+            if can_triage:
+                if time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
+                    # Out of time: stays pending instead of alerting without the triage
                     deferred += 1
                     continue
                 try:
                     description = fetch_description(project["url"])
                     off_profile = not triage(oauth_token, fit_prompt, project, description)
-                    if not off_profile:
-                        proposals_left -= 1
-                        proposal = generate_proposal(
-                            oauth_token,
-                            system,
-                            project,
-                            description,
-                            can_revise=lambda: time.monotonic() - started
-                            <= PROPOSAL_DEADLINE_SECONDS,
-                        )
                 except Exception as exc:  # noqa: BLE001
-                    # Broad on purpose: a proposal error must never crash the run. Actions
-                    # logs are public and a validation error would echo the model output,
-                    # so only ProposalError, built to be safe, is logged in full.
+                    # Broad on purpose: a page error must never crash the run. Actions
+                    # logs are public, so only ProposalError, built to be safe, is logged
+                    # in full.
                     detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
-                    print(f"Falha na proposta de {project['url']}: {detail}", file=sys.stderr)
+                    print(f"Falha ao ler a vaga {project['url']}: {detail}", file=sys.stderr)
                     project["attempts"] += 1
-                    # Too long already had its draft and revision: no other run redoes it
-                    too_long = isinstance(exc, ProposalTooLong)
-                    if not too_long and project["attempts"] < MAX_PROPOSAL_ATTEMPTS:
+                    if project["attempts"] < MAX_PROPOSAL_ATTEMPTS:
                         pending[project["id"]] = _pending_entry(project)
                         save_state()
                         deferred += 1
                         continue
-                    if too_long:
-                        error = "ficou longa demais para caber em duas mensagens do Telegram"
-                    else:
-                        error = "erro ao ler a vaga ou falar com o Claude"
+                    error = "erro ao ler a vaga"
             if off_profile:
-                # Silently dropped: no Telegram alert and no proposal for a rejected job
+                # Silently dropped: no Telegram alert for a rejected job
                 rejected[project["id"]] = {
                     "title": project["title"],
                     "url": project["url"],
@@ -1040,24 +487,14 @@ def main() -> None:
                 save_state()
                 turned_down += 1
                 continue
-            alert_sent = False
-            # Its own message, to copy whole; split only when it is longer than one
-            proposal_chunks = split_message(format_proposal(proposal)) if proposal else []
             try:
-                for chunk in split_message(format_notification(project, proposal, error)):
+                for chunk in split_message(format_notification(project, error)):
                     send_with_retry(token, chat_id, chunk)
-                alert_sent = True
-                send_chunks(token, chat_id, proposal_chunks)
             except requests.RequestException as exc:
                 failed += 1
                 print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
-                entry = _pending_entry(project)
-                if alert_sent and proposal_chunks and cipher:
-                    # The next run sends only the parts left, not a second alert and a
-                    # different proposal
-                    entry["unsent_proposal"] = _encrypt(cipher, proposal_chunks)
-                # Otherwise the next run re-sends the whole alert, proposal included
-                pending[project["id"]] = entry
+                # The next run sends the whole alert again
+                pending[project["id"]] = _pending_entry(project)
                 save_state()
                 continue
             seen.add(project["id"])
@@ -1088,27 +525,13 @@ def triage(
     except Exception as exc:  # noqa: BLE001
         # Same rule as the proposal: only ProposalError is safe for the public logs
         detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
-        print(f"Triagem falhou em {project['url']}, gerando proposta: {detail}", file=sys.stderr)
+        print(f"Triagem falhou em {project['url']}, seguindo como aprovada: {detail}", file=sys.stderr)
         return True
-
-
-def _encrypt(cipher: Fernet, chunks: list[str]) -> str:
-    """The proposal parts not sent yet, stored encrypted since the repo is public."""
-    return cipher.encrypt("\n".join(chunks).encode()).decode()
-
-
-def _decrypt(cipher: Fernet | None, token: str) -> str | None:
-    """The stored proposal message, or None if the key is missing or changed."""
-    if cipher is None:
-        return None
-    try:
-        return cipher.decrypt(token.encode()).decode()
-    except InvalidToken:
-        return None
 
 
 def _pending_entry(project: dict) -> dict:
     return {"title": project["title"], "url": project["url"], "attempts": project["attempts"]}
+
 
 if __name__ == "__main__":
     main()

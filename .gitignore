@@ -4,8 +4,6 @@ debug/
 bot.err.log
 __pycache__/
 .pytest_cache/
-# Plain-text proposal prompt: holds private pricing, only the .enc is committed
-proposal_prompt.md
 .idea/
 temp/
 # Private repos checked out by the workflows (state, triage prompt, proposal skill)
