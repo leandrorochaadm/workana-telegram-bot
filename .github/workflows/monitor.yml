@@ -4,25 +4,41 @@ on:
   # Main schedule lives in scheduler/wrangler.jsonc: a Cloudflare Worker calls
   # workflow_dispatch every 15 min, since GitHub's own schedule is delayed/dropped.
   # This hourly cron is only a fallback in case the Worker stops (e.g. expired
-  # token); extra runs are harmless because seen.json deduplicates projects.
+  # token); extra runs are harmless because proposta/data/seen.json deduplicates projects.
   schedule:
     - cron: "41 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read # state goes to the proposta repo, pushed with its deploy key
+  actions: write # gh workflow run proposal.yml
 
 concurrency:
-  group: monitor
+  # proposal.yml writes data/pending.json too: one run at a time avoids rebase conflicts
+  group: proposta-repo
   cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # Under the 15-min dispatch interval; bot.py's PROPOSAL_* limits are sized to fit it
+    # Under the 15-min dispatch interval; bot.py's TRIAGE_DEADLINE_SECONDS is sized to fit it
     timeout-minutes: 14
     steps:
       - uses: actions/checkout@v7
+
+      - name: Checkout proposta repo
+        # State lives there: without it bot.py exits with 1 instead of alerting every job again
+        uses: actions/checkout@v7
+        with:
+          repository: leandrorochaadm/proposta
+          ssh-key: ${{ secrets.PROPOSTA_DEPLOY_KEY }}
+          path: proposta
+
+      - name: Configure git author
+        working-directory: proposta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - uses: astral-sh/setup-uv@v10.2.0
         with:
@@ -43,7 +59,7 @@ jobs:
       - name: Connect Cloudflare WARP
         # Workana's Cloudflare blocks GitHub's datacenter IPs; WARP's proxy mode routes only
         # the browser through a consumer IP. If it fails the bot still runs without a proxy.
-        # bot.py's PROPOSAL_DEADLINE_SECONDS leaves room for this timeout
+        # bot.py's TRIAGE_DEADLINE_SECONDS leaves room for this timeout
         continue-on-error: true
         timeout-minutes: 2
         run: |
@@ -69,15 +85,14 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code@2.1.282
 
       - name: Run bot
+        id: bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KEYWORDS: ${{ vars.KEYWORDS }}
           EXCLUDE_KEYWORDS: ${{ vars.EXCLUDE_KEYWORDS }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          PROMPT_KEY: ${{ secrets.PROMPT_KEY }}
-          PRICE_HOURLY_RATE: ${{ secrets.PRICE_HOURLY_RATE }}
-        run: uv run --script bot.py
+        run: uv run --script bot.py monitor
 
       - name: Upload debug page
         if: failure()
@@ -88,14 +103,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: Save seen projects
+      - name: Save state
         if: always()
+        working-directory: proposta
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json pending.json rejected.json
-          git diff --cached --quiet && exit 0
-          git commit -m "chore: update seen projects"
-          # a push made during this run would otherwise reject ours and lose sent projects
+          git add data/seen.json data/pending.json data/rejected.json
+          git diff --cached --quiet || git commit -m "chore: update seen projects"
+          # a push made meanwhile (e.g. a hand edit) would otherwise reject ours and lose sent projects
           git pull --rebase
           git push
+
+      - name: Dispatch proposal
+        # The dispatched run waits for this one in the proposta-repo concurrency group
+        if: always() && steps.bot.outputs.has_queue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run proposal.yml

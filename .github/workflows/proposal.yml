@@ -1,0 +1,88 @@
+name: Proposal
+
+on:
+  # Dispatched by monitor.yml while proposta/data/pending.json has jobs waiting
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # monitor.yml writes data/pending.json too: one run at a time avoids rebase conflicts
+  group: proposta-repo
+  cancel-in-progress: false
+
+jobs:
+  proposal:
+    runs-on: ubuntu-latest
+    # bot.py's PROPOSAL_TIMEOUT_SECONDS is sized to fit it
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout proposta repo
+        uses: actions/checkout@v7
+        with:
+          repository: leandrorochaadm/proposta
+          ssh-key: ${{ secrets.PROPOSTA_DEPLOY_KEY }}
+          path: proposta
+
+      - name: Configure git author
+        working-directory: proposta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout proposal skill
+        id: skill
+        # Without the skill bot.py counts a failed attempt, so the queue never stalls
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: leandrorochaadm/dotfiles
+          ssh-key: ${{ secrets.DOTFILES_DEPLOY_KEY }}
+          path: dotfiles
+          # Cone mode would also bring every root dotfile (.zshrc, .gitconfig.*)
+          sparse-checkout: /.claude/skills/proposta-freela/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Link proposal skill
+        if: steps.skill.outcome == 'success'
+        # The skill runs its scripts from ~/.claude/skills/proposta-freela
+        run: |
+          mkdir -p ~/.claude/skills
+          ln -s "$GITHUB_WORKSPACE/dotfiles/.claude/skills/proposta-freela" ~/.claude/skills/proposta-freela
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: bot.py
+
+      - name: Install Claude Code
+        # Pinned: the bot relies on this version's flags and JSON output
+        run: npm install -g @anthropic-ai/claude-code@2.1.282
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: uv run --script bot.py propose
+
+      - name: Save state
+        if: always()
+        working-directory: proposta
+        run: |
+          git add data/pending.json data/seen.json
+          git diff --cached --quiet || git commit -m "chore: update proposal queue"
+          # also pushes a proposal commit whose own push failed during the run
+          git pull --rebase
+          git push
+
+      - name: Fail on missing skill
+        # A red run makes GitHub email about the broken checkout
+        if: always() && steps.skill.outcome == 'failure'
+        run: |
+          echo "Checkout da skill falhou; nenhuma proposta gerada" >&2
+          exit 1
