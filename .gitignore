@@ -8,3 +8,6 @@ __pycache__/
 proposal_prompt.md
 .idea/
 temp/
+# Private repos checked out by the workflows (state, triage prompt, proposal skill)
+proposta/
+dotfiles/
