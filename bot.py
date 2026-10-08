@@ -9,6 +9,7 @@
 # ///
 """Monitora projetos novos na Workana filtrados por palavras-chave e avisa no Telegram."""
 
+import argparse
 import html
 import json
 import os
@@ -22,6 +23,7 @@ import unicodedata
 from datetime import UTC, datetime
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -37,7 +39,8 @@ ENV_FILE = BASE_DIR / ".env"
 PROPOSTA_DIR = BASE_DIR / "proposta"
 DATA_DIR = PROPOSTA_DIR / "data"
 SEEN_FILE = DATA_DIR / "seen.json"
-# Matched jobs not alerted yet: {id: {"title", "url", "attempts"}}
+# Matched jobs not alerted yet: {id: {"title", "url", "status", "attempts", "description"?,
+# "proposal"?}}; see JobStatus
 PENDING_FILE = DATA_DIR / "pending.json"
 # Jobs the triage turned down, kept to tune the triage prompt: {id: {"title", "url", "date"}}
 REJECTED_FILE = DATA_DIR / "rejected.json"
@@ -106,17 +109,30 @@ Ao terminar, devolva `price` com o preço fechado no formato `R$ 6 000` e `deadl
 FIT_MODEL = "claude-haiku-4-5-20251001"
 FIT_TIMEOUT_SECONDS = 60
 PAGE_TIMEOUT_MS = 30_000
-# Worst case must fit the workflow's 14-min timeout: ~1.5 min of setup, up to 2 min
-# connecting WARP, the deadline below, then one last job (page + Haiku triage) and
-# the commit
-PROPOSAL_DEADLINE_SECONDS = 5 * 60
-# A job whose page keeps failing is sent without a proposal after this many tries,
-# so it cannot cost a page load every run forever
-MAX_PROPOSAL_ATTEMPTS = 3
+# The monitor stops reading descriptions and triaging past this, so its worst case fits
+# monitor.yml's 14 min: ~1.5 min of setup, up to 2 min connecting WARP, the deadline,
+# then one last job (page + Haiku triage) and the commit. Proposals run apart, in
+# proposal.yml, under PROPOSAL_TIMEOUT_SECONDS
+TRIAGE_DEADLINE_SECONDS = 5 * 60
+# Tries of one job, reading its page (monitor) or writing its proposal (propose), before
+# the alert goes out without a proposal, so a job cannot cost every run forever
+MAX_JOB_ATTEMPTS = 3
+# proposal.yml runs one agent per dispatch; the monitor dispatches again while the queue lasts
+MAX_PROPOSALS_PER_RUN = 1
 TELEGRAM_MAX_CHARS = 4096
 # Covers a short Telegram hiccup before the job waits for the next run
 TELEGRAM_SEND_ATTEMPTS = 3
 TELEGRAM_RETRY_SECONDS = 2
+# Settings, read from .env first and then from the environment (the workflows' secrets)
+TELEGRAM_TOKEN_ENV = "TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
+KEYWORDS_ENV = "KEYWORDS"
+EXCLUDE_KEYWORDS_ENV = "EXCLUDE_KEYWORDS"
+# File GitHub Actions gives each step for its outputs; unset outside the Actions
+GITHUB_OUTPUT_ENV = "GITHUB_OUTPUT"
+# monitor.yml dispatches proposal.yml when this output is true
+HAS_QUEUE_OUTPUT = "has_queue"
+CLAUDE_CLI = "claude"
 
 
 class ProposalError(Exception):
@@ -144,6 +160,38 @@ class Proposal(BaseModel):
     deadline: str
 
 
+class RunMode(StrEnum):
+    """What a run does, given as bot.py's only argument."""
+
+    MONITOR = "monitor"  # monitor.yml: read, filter, triage, queue
+    PROPOSE = "propose"  # proposal.yml: generate, publish, alert
+
+
+class JobStatus(StrEnum):
+    """Where a job stands in pending.json."""
+
+    TRIAGE = "triage"  # matched the keywords, description and triage still to do
+    PROPOSAL = "proposal"  # passed the triage, waiting for proposal.yml
+    ALERT = "alert"  # proposal written (or given up), alert not sent yet
+
+    @classmethod
+    def from_api(cls, raw: object, job_id: str) -> "JobStatus":
+        """The status as pending.json spells it.
+
+        Unknown value (hand edit, newer version) falls back to TRIAGE with a log line
+        (job id only): triaging again is safe, since the job was not alerted yet.
+        """
+        try:
+            return cls(raw)
+        except ValueError:
+            print(f"Status desconhecido na vaga {job_id}, voltando para a triagem", file=sys.stderr)
+            return cls.TRIAGE
+
+
+# What proposal.yml handles, in this order: an ALERT job only misses its alert
+PROPOSAL_RUN_STATUSES = (JobStatus.ALERT, JobStatus.PROPOSAL)
+
+
 def load_env() -> dict[str, str]:
     env: dict[str, str] = {}
     if ENV_FILE.exists():
@@ -154,6 +202,16 @@ def load_env() -> dict[str, str]:
             key, _, value = line.partition("=")
             env[key.strip()] = value.strip()
     return env
+
+
+def setting(env: dict[str, str], key: str) -> str | None:
+    """A setting from .env, or else from the environment, where the workflows put secrets."""
+    return env.get(key) or os.environ.get(key)
+
+
+def setting_list(env: dict[str, str], key: str) -> list[str]:
+    """A comma-separated setting, without blanks."""
+    return [item.strip() for item in (setting(env, key) or "").split(",") if item.strip()]
 
 
 def load_seen() -> set[str]:
@@ -167,13 +225,25 @@ def save_seen(seen: set[str]) -> None:
 
 
 def load_pending() -> dict[str, dict]:
-    if PENDING_FILE.exists():
-        return json.loads(PENDING_FILE.read_text())
-    return {}
+    """The queue, typed: status as JobStatus, proposal as Proposal."""
+    if not PENDING_FILE.exists():
+        return {}
+    pending = json.loads(PENDING_FILE.read_text())
+    for pid, job in pending.items():
+        job["status"] = JobStatus.from_api(job.get("status"), pid)
+        if "proposal" in job:
+            job["proposal"] = Proposal.model_validate(job["proposal"])
+    return pending
 
 
 def save_pending(pending: dict[str, dict]) -> None:
-    PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
+    stored = {}
+    for pid, job in pending.items():
+        entry = {**job, "status": job["status"].value}
+        if "proposal" in job:
+            entry["proposal"] = job["proposal"].model_dump()
+        stored[pid] = entry
+    PENDING_FILE.write_text(json.dumps(stored, ensure_ascii=False, indent=2))
 
 
 def load_rejected() -> dict[str, dict]:
@@ -192,6 +262,20 @@ def load_fit_prompt() -> str | None:
         return None
     # The file ends in a newline the old literal did not have
     return FIT_PROMPT_FILE.read_text().strip() or None
+
+
+def has_queue(pending: dict[str, dict]) -> bool:
+    """Whether proposal.yml has work: a proposal to write or an alert to send."""
+    return any(job["status"] in PROPOSAL_RUN_STATUSES for job in pending.values())
+
+
+def write_output(name: str, value: str) -> None:
+    """A step output for the workflow; does nothing outside GitHub Actions."""
+    path = os.environ.get(GITHUB_OUTPUT_ENV)
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(f"{name}={value}\n")
 
 
 @contextmanager
@@ -448,7 +532,7 @@ def call_claude(
     mode_args = ["--permission-mode", AGENT_PERMISSION_MODE] if tools else []
     result = subprocess.run(
         [
-            "claude",
+            CLAUDE_CLI,
             "-p",
             "--model", model,
             *effort_args,
@@ -487,9 +571,16 @@ def call_claude(
     return output["structured_output"]
 
 
-def format_notification(project: dict[str, str], error: str | None) -> str:
+def format_notification(
+    project: dict[str, str], proposal: Proposal | None, error: str | None
+) -> str:
     text = f"🆕 <b>{html.escape(project['title'])}</b>\n{project['url']}"
-    if error:
+    if proposal:
+        text += (
+            f"\n\n💰 <b>Preço:</b> {html.escape(proposal.price)}"
+            f"\n⏱ <b>Prazo:</b> {html.escape(proposal.deadline)}"
+        )
+    elif error:
         text += f"\n\n⚠️ Proposta não gerada: {html.escape(error)}"
     return text
 
@@ -568,22 +659,36 @@ def send_with_retry(token: str, chat_id: str, text: str) -> None:
             time.sleep(TELEGRAM_RETRY_SECONDS)
 
 
-def main() -> None:
+def _send_alert(
+    token: str, chat_id: str, project: dict, proposal: Proposal | None, error: str | None
+) -> bool:
+    """Sends the job's alert; False, logged, when Telegram still fails after the retries."""
+    try:
+        for chunk in split_message(format_notification(project, proposal, error)):
+            send_with_retry(token, chat_id, chunk)
+    except requests.RequestException as exc:
+        print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def parse_mode(argv: Sequence[str] | None = None) -> RunMode:
+    parser = argparse.ArgumentParser(
+        description="Monitora a Workana (monitor) ou escreve a próxima proposta da fila (propose)."
+    )
+    parser.add_argument("mode", type=RunMode, choices=list(RunMode), help="o que este run faz")
+    return parser.parse_args(argv).mode
+
+
+def main(argv: Sequence[str] | None = None) -> None:
     # The triage deadline counts from here: the listing scrape eats the same job timeout
     started = time.monotonic()
+    mode = parse_mode(argv)
     env = load_env()
-    token = env.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-    chat_id = env.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-    keywords_raw = env.get("KEYWORDS") or os.environ.get("KEYWORDS", "")
-    keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-    excluded_raw = env.get("EXCLUDE_KEYWORDS") or os.environ.get("EXCLUDE_KEYWORDS", "")
-    excluded = [k.strip() for k in excluded_raw.split(",") if k.strip()]
-
+    token = setting(env, TELEGRAM_TOKEN_ENV)
+    chat_id = setting(env, TELEGRAM_CHAT_ID_ENV)
     if not token or not chat_id:
         print("Faltam TELEGRAM_TOKEN e/ou TELEGRAM_CHAT_ID no .env", file=sys.stderr)
-        sys.exit(1)
-    if not keywords:
-        print("Nenhuma keyword configurada em KEYWORDS no .env", file=sys.stderr)
         sys.exit(1)
     if not DATA_DIR.is_dir():
         # Without seen.json every job in the listing would be alerted again
@@ -592,60 +697,86 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    oauth_token = setting(env, OAUTH_TOKEN_ENV)
+    match mode:
+        case RunMode.MONITOR:
+            run_monitor(env, token, chat_id, oauth_token, started)
+        case RunMode.PROPOSE:
+            run_propose(token, chat_id, oauth_token)
 
-    oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+
+def run_monitor(
+    env: dict[str, str], token: str, chat_id: str, oauth_token: str | None, started: float
+) -> None:
+    """monitor.yml: reads the listing, filters by keyword and triages.
+
+    Approved jobs wait in pending.json for proposal.yml, which writes the proposal and
+    sends the alert; has_queue tells the workflow to dispatch it.
+    """
+    keywords = setting_list(env, KEYWORDS_ENV)
+    excluded = setting_list(env, EXCLUDE_KEYWORDS_ENV)
+    if not keywords:
+        print("Nenhuma keyword configurada em KEYWORDS no .env", file=sys.stderr)
+        sys.exit(1)
+
     fit_prompt = load_fit_prompt()
-    # Without any of the three every keyword match is alerted, as on a local run
+    # Without any of the three every keyword match is alerted at once, with no proposal
     can_triage = False
-    if oauth_token:
-        if fit_prompt is None:
-            print("Falta proposta/prompts/fit_prompt.md, seguindo sem triagem", file=sys.stderr)
-        elif shutil.which("claude") is None:
-            print("Claude Code não instalado, seguindo sem triagem", file=sys.stderr)
-        else:
-            can_triage = True
+    if not oauth_token:
+        print(f"Falta {OAUTH_TOKEN_ENV}, seguindo sem triagem", file=sys.stderr)
+    elif fit_prompt is None:
+        print("Falta proposta/prompts/fit_prompt.md, seguindo sem triagem", file=sys.stderr)
+    elif shutil.which(CLAUDE_CLI) is None:
+        print("Claude Code não instalado, seguindo sem triagem", file=sys.stderr)
+    else:
+        can_triage = True
 
     seen = load_seen()
     pending = load_pending()
     rejected = load_rejected()
-    projects = fetch_projects()
 
     def save_state() -> None:
         save_seen(seen)
         save_pending(pending)
         save_rejected(rejected)
 
-    # New matches are queued (and saved) before any work, so a run killed mid-way
-    # cannot lose a job that has already left the listing page
-    for project in projects:
-        if project["id"] in seen or project["id"] in pending:
-            continue
-        if matches_keywords(project["title"], keywords):
-            pending[project["id"]] = _pending_entry({**project, "attempts": 0})
-        else:
-            seen.add(project["id"])
-    # Also drops jobs queued before a word was excluded
-    for pid, job in list(pending.items()):
-        if matches_keywords(job["title"], excluded):
-            pending.pop(pid)
-            seen.add(pid)
-    save_state()
-    # dicts keep insertion order, so this is oldest first
-    candidates = [{"id": pid, **job} for pid, job in pending.items()]
-
-    sent = failed = deferred = turned_down = 0
+    sent = queued = failed = deferred = turned_down = 0
     try:
+        projects = fetch_projects()
+        # New matches are queued (and saved) before any work, so a run killed mid-way
+        # cannot lose a job that has already left the listing page
+        for project in projects:
+            if project["id"] in seen or project["id"] in pending:
+                continue
+            if matches_keywords(project["title"], keywords):
+                pending[project["id"]] = _pending_entry(
+                    {**project, "status": JobStatus.TRIAGE, "attempts": 0}
+                )
+            else:
+                seen.add(project["id"])
+        # Also drops jobs queued before a word was excluded, unless their proposal is
+        # already written and only the alert is missing
+        for pid, job in list(pending.items()):
+            if job["status"] is not JobStatus.ALERT and matches_keywords(job["title"], excluded):
+                pending.pop(pid)
+                seen.add(pid)
+        save_state()
+        # dicts keep insertion order, so this is oldest first; PROPOSAL and ALERT jobs
+        # belong to proposal.yml
+        candidates = [
+            {"id": pid, **job}
+            for pid, job in pending.items()
+            if job["status"] is JobStatus.TRIAGE
+        ]
         for project in candidates:
             error = None
-            off_profile = False
             if can_triage:
-                if time.monotonic() - started > PROPOSAL_DEADLINE_SECONDS:
-                    # Out of time: stays pending instead of alerting without the triage
+                if time.monotonic() - started > TRIAGE_DEADLINE_SECONDS:
+                    # Out of time: stays in triage for the next run
                     deferred += 1
                     continue
                 try:
                     description = fetch_description(project["url"])
-                    off_profile = not triage(oauth_token, fit_prompt, project, description)
                 except Exception as exc:  # noqa: BLE001
                     # Broad on purpose: a page error must never crash the run. Actions
                     # logs are public, so only ProposalError, built to be safe, is logged
@@ -653,45 +784,132 @@ def main() -> None:
                     detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
                     print(f"Falha ao ler a vaga {project['url']}: {detail}", file=sys.stderr)
                     project["attempts"] += 1
-                    if project["attempts"] < MAX_PROPOSAL_ATTEMPTS:
+                    if project["attempts"] < MAX_JOB_ATTEMPTS:
                         pending[project["id"]] = _pending_entry(project)
                         save_state()
                         deferred += 1
                         continue
                     error = "erro ao ler a vaga"
-            if off_profile:
-                # Silently dropped: no Telegram alert for a rejected job
-                rejected[project["id"]] = {
-                    "title": project["title"],
-                    "url": project["url"],
-                    "date": datetime.now(UTC).date().isoformat(),
-                }
+                else:
+                    if triage(oauth_token, fit_prompt, project, description):
+                        # proposal.yml writes the proposal and sends the alert
+                        pending[project["id"]] = _pending_entry(
+                            {**project, "status": JobStatus.PROPOSAL, "description": description}
+                        )
+                        save_state()
+                        queued += 1
+                        continue
+                    # Silently dropped: no Telegram alert and no proposal for a rejected job
+                    rejected[project["id"]] = {
+                        "title": project["title"],
+                        "url": project["url"],
+                        "date": datetime.now(UTC).date().isoformat(),
+                    }
+                    seen.add(project["id"])
+                    pending.pop(project["id"], None)
+                    save_state()
+                    turned_down += 1
+                    continue
+            if _send_alert(token, chat_id, project, None, error):
                 seen.add(project["id"])
                 pending.pop(project["id"], None)
+                # Saved per job so a run killed mid-way does not re-send what already went out
                 save_state()
-                turned_down += 1
-                continue
-            try:
-                for chunk in split_message(format_notification(project, error)):
-                    send_with_retry(token, chat_id, chunk)
-            except requests.RequestException as exc:
+                sent += 1
+            else:
                 failed += 1
-                print(f"Falha ao enviar {project['url']}: {exc}", file=sys.stderr)
                 # The next run sends the whole alert again
                 pending[project["id"]] = _pending_entry(project)
                 save_state()
-                continue
-            seen.add(project["id"])
-            pending.pop(project["id"], None)
-            # Saved per job so a run killed mid-way does not re-send what already went out
-            save_state()
-            sent += 1
+    finally:
+        save_state()
+        # Also when the listing fails: jobs queued by earlier runs still need proposal.yml
+        write_output(HAS_QUEUE_OUTPUT, json.dumps(has_queue(pending)))
+
+    print(
+        f"{len(projects)} projetos lidos, {queued} na fila de propostas, {sent} enviados, "
+        f"{turned_down} rejeitados na triagem, {deferred} adiados, {failed} com falha."
+    )
+    if failed:
+        sys.exit(1)
+
+
+def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
+    """proposal.yml: sends the alerts left over, then writes the oldest queued proposal
+    with the agent and sends its alert."""
+    skill = SKILL_FILE.read_text() if SKILL_FILE.is_file() else None
+    # Counted as a failed try on the oldest job, so the queue never stalls for good
+    blocker = None
+    if skill is None:
+        blocker = "Skill proposta-freela não encontrada"
+    elif not oauth_token:
+        blocker = f"Falta {OAUTH_TOKEN_ENV}"
+    elif shutil.which(CLAUDE_CLI) is None:
+        blocker = "Claude Code não instalado"
+
+    seen = load_seen()
+    pending = load_pending()
+
+    def save_state() -> None:
+        save_seen(seen)
+        save_pending(pending)
+
+    # dicts keep insertion order, so each status comes oldest first
+    candidates = [
+        {"id": pid, **job}
+        for status in PROPOSAL_RUN_STATUSES
+        for pid, job in pending.items()
+        if job["status"] is status
+    ]
+    proposals_left = MAX_PROPOSALS_PER_RUN
+    sent = generated = failed = deferred = 0
+    try:
+        for project in candidates:
+            if project["status"] is JobStatus.PROPOSAL:
+                if proposals_left <= 0:
+                    # The rest waits for the next dispatch
+                    break
+                proposals_left -= 1
+                try:
+                    if blocker:
+                        raise ProposalError(blocker)
+                    project["proposal"] = generate_proposal(
+                        oauth_token, skill, project, project.get("description", "")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Same rule as the monitor: only ProposalError is safe for the public logs
+                    detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
+                    print(f"Falha na proposta de {project['url']}: {detail}", file=sys.stderr)
+                    project["attempts"] += 1
+                    if project["attempts"] < MAX_JOB_ATTEMPTS:
+                        pending[project["id"]] = _pending_entry(project)
+                        save_state()
+                        deferred += 1
+                        continue
+                    # Given up: the alert goes out without a proposal
+                else:
+                    generated += 1
+                project["status"] = JobStatus.ALERT
+                # Saved before the alert: if Telegram fails, the next run sends only the
+                # alert, without writing the proposal again
+                pending[project["id"]] = _pending_entry(project)
+                save_state()
+            proposal = project.get("proposal")
+            error = None if proposal else "erro ao gerar a proposta"
+            if _send_alert(token, chat_id, project, proposal, error):
+                seen.add(project["id"])
+                pending.pop(project["id"], None)
+                save_state()
+                sent += 1
+            else:
+                # Stays in ALERT, already saved
+                failed += 1
     finally:
         save_state()
 
     print(
-        f"{len(projects)} projetos lidos, {sent} enviados, {turned_down} rejeitados na triagem, "
-        f"{deferred} adiados, {failed} com falha."
+        f"{generated} propostas escritas, {sent} alertas enviados, {deferred} adiadas, "
+        f"{failed} com falha."
     )
     if failed:
         sys.exit(1)
@@ -714,7 +932,18 @@ def triage(
 
 
 def _pending_entry(project: dict) -> dict:
-    return {"title": project["title"], "url": project["url"], "attempts": project["attempts"]}
+    """What pending.json keeps of a job; status and proposal stay typed until save_pending."""
+    entry = {
+        "title": project["title"],
+        "url": project["url"],
+        "status": project["status"],
+        "attempts": project["attempts"],
+    }
+    # Set by the triage and by the agent, in that order
+    for key in ("description", "proposal"):
+        if key in project:
+            entry[key] = project[key]
+    return entry
 
 
 if __name__ == "__main__":

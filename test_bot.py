@@ -12,6 +12,10 @@ import bot
 
 KEYWORDS = ["aplicativo", "app"]
 
+# bot.py's only argument, as the workflows pass it
+MONITOR_ARGV = ["monitor"]
+PROPOSE_ARGV = ["propose"]
+
 
 @pytest.mark.parametrize(
     ("title", "expected"),
@@ -67,10 +71,14 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "REJECTED_FILE", data / "rejected.json")
     monkeypatch.setattr(bot, "FIT_PROMPT_FILE", fit_prompt)
     monkeypatch.setattr(bot, "GENERATED_DIR", proposta / "generated")
+    # Never the developer's own ~/.claude skill: missing unless the skill fixture sets it up
+    skill_dir = tmp_path / "home" / ".claude" / "skills" / "proposta-freela"
+    monkeypatch.setattr(bot, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(bot, "SKILL_FILE", skill_dir / "SKILL.md")
     monkeypatch.setattr(bot, "TELEGRAM_RETRY_SECONDS", 0)
     for var in (
         "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "KEYWORDS", "EXCLUDE_KEYWORDS",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN", "GITHUB_OUTPUT",
     ):
         monkeypatch.delenv(var, raising=False)
     (tmp_path / ".env").write_text(
@@ -105,6 +113,17 @@ def _project(pid: str, title: str) -> dict[str, str]:
     return {"id": pid, "title": title, "url": f"https://www.workana.com/job/{pid}"}
 
 
+def _queued(pid: str, title: str, status: bot.JobStatus, attempts: int = 0, **extra) -> dict:
+    """A pending.json entry as load_pending returns it."""
+    return {
+        "title": title,
+        "url": _project(pid, title)["url"],
+        "status": status,
+        "attempts": attempts,
+        **extra,
+    }
+
+
 @pytest.fixture
 def sent(monkeypatch):
     messages: list[str] = []
@@ -131,7 +150,7 @@ def test_main_sends_only_new_matches(workdir, sent, monkeypatch) -> None:
         ],
     )
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert len(sent) == 1
     assert "App novo" in sent[0]
@@ -141,7 +160,7 @@ def test_main_sends_only_new_matches(workdir, sent, monkeypatch) -> None:
 def test_main_escapes_html_in_title(workdir, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App <b>&</b>")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert "App &lt;b&gt;&amp;&lt;/b&gt;" in sent[0]
 
@@ -154,7 +173,7 @@ def test_main_retries_failed_send_on_next_run(workdir, sent, monkeypatch) -> Non
     )
 
     with pytest.raises(SystemExit) as exc:
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert exc.value.code == 1
     assert len(sent) == 1
@@ -171,7 +190,7 @@ def test_main_saves_seen_when_fetch_succeeds_but_send_crashes(workdir, monkeypat
     )
 
     with pytest.raises(RuntimeError):
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert bot.load_seen() == {"site"}
 
@@ -179,26 +198,75 @@ def test_main_saves_seen_when_fetch_succeeds_but_send_crashes(workdir, monkeypat
 def test_main_skips_excluded_jobs_including_queued_ones(workdir, sent, monkeypatch) -> None:
     with bot.ENV_FILE.open("a") as f:
         f.write("EXCLUDE_KEYWORDS=jogo, wordpress ,\n")
-    bot.save_pending({"old": {"title": "App de jogo", "url": "u", "attempts": 1}})
+    bot.save_pending(
+        {
+            "old": _queued("old", "App de jogo", bot.JobStatus.TRIAGE, attempts=1),
+            # Proposal already given up on: its alert still goes out from proposal.yml
+            "pronto": _queued("pronto", "App de jogo pronto", bot.JobStatus.ALERT),
+        }
+    )
     monkeypatch.setattr(
         bot,
         "fetch_projects",
         lambda: [_project("wp", "App WordPress"), _project("ok", "App de delivery")],
     )
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert len(sent) == 1
     assert "App de delivery" in sent[0]
     assert bot.load_seen() == {"old", "wp", "ok"}
-    assert bot.load_pending() == {}
+    assert set(bot.load_pending()) == {"pronto"}
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (None, "false"),
+        # Without the triage the monitor alerts it at once: nothing left for proposal.yml
+        (bot.JobStatus.TRIAGE, "false"),
+        (bot.JobStatus.PROPOSAL, "true"),
+        (bot.JobStatus.ALERT, "true"),
+    ],
+    ids=["empty", "triage", "proposal", "alert"],
+)
+def test_monitor_writes_has_queue_output(workdir, sent, monkeypatch, status, expected) -> None:
+    output = workdir / "github_output"
+    output.write_text("earlier=1\n")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    if status is not None:
+        bot.save_pending({"x": _queued("x", "App novo", status)})
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [])
+
+    bot.main(MONITOR_ARGV)
+
+    # Appended: the file holds the other steps' outputs too
+    assert output.read_text() == f"earlier=1\nhas_queue={expected}\n"
+
+
+def test_monitor_writes_has_queue_when_listing_fails(workdir, monkeypatch) -> None:
+    output = workdir / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    bot.save_pending({"x": _queued("x", "App novo", bot.JobStatus.PROPOSAL)})
+
+    def blocked_listing() -> list[dict[str, str]]:
+        raise RuntimeError("Cloudflare")
+
+    monkeypatch.setattr(bot, "fetch_projects", blocked_listing)
+
+    with pytest.raises(RuntimeError):
+        bot.main(MONITOR_ARGV)
+
+    # The queue from earlier runs still gets its proposal.yml dispatch
+    assert output.read_text() == "has_queue=true\n"
+    assert set(bot.load_pending()) == {"x"}
 
 
 def test_main_exits_without_credentials(workdir) -> None:
     bot.ENV_FILE.write_text("KEYWORDS=app\n")
 
     with pytest.raises(SystemExit) as exc:
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert exc.value.code == 1
 
@@ -207,12 +275,37 @@ def test_main_exits_without_keywords(workdir) -> None:
     bot.ENV_FILE.write_text("TELEGRAM_TOKEN=tok\nTELEGRAM_CHAT_ID=42\n")
 
     with pytest.raises(SystemExit) as exc:
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert exc.value.code == 1
 
 
-def test_exits_without_data_dir(workdir, sent, monkeypatch, capsys) -> None:
+@pytest.mark.parametrize(
+    "argv", [[], ["outro"], ["Monitor"]], ids=["missing", "unknown", "wrong-case"]
+)
+def test_main_rejects_unknown_mode(workdir, sent, monkeypatch, argv) -> None:
+    monkeypatch.setattr(bot, "fetch_projects", lambda: pytest.fail("read Workana"))
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(argv)
+
+    # argparse's usage error, before any setting or state is read
+    assert exc.value.code == 2
+    assert sent == []
+
+
+def test_propose_runs_without_keywords(workdir, sent, monkeypatch) -> None:
+    # proposal.yml passes no KEYWORDS: only the monitor reads the listing
+    bot.ENV_FILE.write_text("TELEGRAM_TOKEN=tok\nTELEGRAM_CHAT_ID=42\n")
+    monkeypatch.setattr(bot, "fetch_projects", lambda: pytest.fail("propose read Workana"))
+
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == []
+
+
+@pytest.mark.parametrize("argv", [MONITOR_ARGV, PROPOSE_ARGV], ids=["monitor", "propose"])
+def test_exits_without_data_dir(workdir, sent, monkeypatch, capsys, argv) -> None:
     bot.DATA_DIR.rmdir()
 
     def fetch_without_state() -> list[dict[str, str]]:
@@ -221,7 +314,7 @@ def test_exits_without_data_dir(workdir, sent, monkeypatch, capsys) -> None:
     monkeypatch.setattr(bot, "fetch_projects", fetch_without_state)
 
     with pytest.raises(SystemExit) as exc:
-        bot.main()
+        bot.main(argv)
 
     assert exc.value.code == 1
     assert sent == []
@@ -265,36 +358,73 @@ def with_triage(workdir, monkeypatch):
     return calls
 
 
-def test_main_sends_alert_after_triage_approves(with_triage, sent, monkeypatch) -> None:
-    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
+def _drop_token(monkeypatch) -> None:
+    bot.ENV_FILE.write_text(
+        bot.ENV_FILE.read_text().replace("CLAUDE_CODE_OAUTH_TOKEN=oauth-test\n", "")
+    )
 
-    bot.main()
+
+def _drop_claude(monkeypatch) -> None:
+    monkeypatch.setattr(bot.shutil, "which", lambda _cmd: None)
+
+
+def _drop_fit_prompt(monkeypatch) -> None:
+    bot.FIT_PROMPT_FILE.unlink()
+
+
+def _blank_fit_prompt(monkeypatch) -> None:
+    bot.FIT_PROMPT_FILE.write_text(" \n")
+
+
+def _drop_skill(monkeypatch) -> None:
+    bot.SKILL_FILE.unlink()
+
+
+def test_monitor_queues_approved_job_with_description(with_triage, sent, monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot,
+        "fetch_projects",
+        lambda: [_project("x", "App novo"), _project("logo", "App de logo")],
+    )
+
+    bot.main(MONITOR_ARGV)
 
     assert with_triage == [
-        ("oauth-test", FIT_PROMPT_TEXT, "x", "descrição de https://www.workana.com/job/x")
+        ("oauth-test", FIT_PROMPT_TEXT, "x", "descrição de https://www.workana.com/job/x"),
+        ("oauth-test", FIT_PROMPT_TEXT, "logo", "descrição de https://www.workana.com/job/logo"),
     ]
-    # Only the alert: no proposal until the agent takes over
-    assert sent == ["🆕 <b>App novo</b>\nhttps://www.workana.com/job/x"]
-    assert bot.load_seen() == {"x"}
-    assert bot.load_pending() == {}
+    # The alert goes out from proposal.yml, with the proposal
+    assert sent == []
+    assert bot.load_pending() == {
+        "x": _queued(
+            "x",
+            "App novo",
+            bot.JobStatus.PROPOSAL,
+            description="descrição de https://www.workana.com/job/x",
+        )
+    }
+    assert set(bot.load_rejected()) == {"logo"}
+    assert bot.load_seen() == {"logo"}
 
 
 def test_main_defers_job_whose_page_fails_to_next_run(with_triage, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("quebra", "App quebra")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert with_triage == []
     assert sent == []
     assert bot.load_seen() == set()
-    assert bot.load_pending()["quebra"]["attempts"] == 1
+    assert bot.load_pending() == {
+        "quebra": _queued("quebra", "App quebra", bot.JobStatus.TRIAGE, attempts=1)
+    }
 
 
 def test_main_alerts_after_max_attempts_reading_the_page(with_triage, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("quebra", "App quebra")])
 
-    for _ in range(bot.MAX_PROPOSAL_ATTEMPTS):
-        bot.main()
+    for _ in range(bot.MAX_JOB_ATTEMPTS):
+        bot.main(MONITOR_ARGV)
 
     assert with_triage == []
     [alert] = sent
@@ -305,23 +435,28 @@ def test_main_alerts_after_max_attempts_reading_the_page(with_triage, sent, monk
 
 
 def test_main_retries_pending_job_that_left_the_listing(with_triage, sent, monkeypatch) -> None:
-    project = _project("x", "App antigo")
-    bot.save_pending({"x": {"title": project["title"], "url": project["url"], "attempts": 1}})
+    bot.save_pending({"x": _queued("x", "App antigo", bot.JobStatus.TRIAGE, attempts=1)})
     monkeypatch.setattr(bot, "fetch_projects", lambda: [])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert len(with_triage) == 1
-    [alert] = sent
-    assert "App antigo" in alert
-    assert bot.load_seen() == {"x"}
-    assert bot.load_pending() == {}
+    assert sent == []
+    assert bot.load_pending() == {
+        "x": _queued(
+            "x",
+            "App antigo",
+            bot.JobStatus.PROPOSAL,
+            attempts=1,
+            description="descrição de https://www.workana.com/job/x",
+        )
+    }
 
 
 def test_main_skips_rejected_job_silently(with_triage, sent, monkeypatch) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App de logo")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert len(with_triage) == 1
     assert sent == []
@@ -333,55 +468,54 @@ def test_main_skips_rejected_job_silently(with_triage, sent, monkeypatch) -> Non
     assert job["url"] == "https://www.workana.com/job/x" and job["date"]
 
 
-def test_main_alerts_when_triage_fails(with_triage, sent, monkeypatch, capsys) -> None:
+def test_main_queues_job_when_triage_fails(with_triage, sent, monkeypatch, capsys) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App triagem")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
-    assert len(sent) == 1
+    # Fails open: the job goes on to the proposal
+    assert sent == []
+    assert bot.load_pending()["x"]["status"] is bot.JobStatus.PROPOSAL
     err = capsys.readouterr().err
     assert "Triagem falhou" in err and "ValueError" in err
     assert "sigiloso" not in err
-    assert bot.load_seen() == {"x"}
+    assert bot.load_seen() == set()
 
 
 def test_main_logs_triage_error_details(with_triage, sent, monkeypatch, capsys) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App vencido")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert "api_error_status=401" in capsys.readouterr().err
-    assert len(sent) == 1
+    assert sent == []
+    assert bot.load_pending()["x"]["status"] is bot.JobStatus.PROPOSAL
 
 
-def test_main_alerts_only_without_claude_cli(with_triage, sent, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(bot.shutil, "which", lambda _cmd: None)
-    monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
-
-    bot.main()
-
-    assert with_triage == []
-    assert len(sent) == 1
-    assert "Claude Code não instalado" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("content", [None, " \n"])
-def test_main_alerts_only_without_fit_prompt(
-    with_triage, sent, monkeypatch, capsys, content
+@pytest.mark.parametrize(
+    ("drop", "message"),
+    [
+        (_drop_token, "CLAUDE_CODE_OAUTH_TOKEN"),
+        (_drop_claude, "Claude Code não instalado"),
+        (_drop_fit_prompt, "fit_prompt.md"),
+        (_blank_fit_prompt, "fit_prompt.md"),
+    ],
+    ids=["no-token", "no-claude", "no-fit-prompt", "blank-fit-prompt"],
+)
+def test_monitor_alerts_only_without_triage_requirements(
+    with_triage, sent, monkeypatch, capsys, drop, message
 ) -> None:
-    if content is None:
-        bot.FIT_PROMPT_FILE.unlink()
-    else:
-        bot.FIT_PROMPT_FILE.write_text(content)
+    drop(monkeypatch)
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
+    # No triage, so no Claude call and no proposal: the alert goes out at once
     assert with_triage == []
-    assert len(sent) == 1
-    assert "App novo" in sent[0]
-    assert "fit_prompt.md" in capsys.readouterr().err
-    assert "x" in bot.load_seen()
+    assert sent == ["🆕 <b>App novo</b>\nhttps://www.workana.com/job/x"]
+    assert message in capsys.readouterr().err
+    assert bot.load_seen() == {"x"}
+    assert bot.load_pending() == {}
 
 
 def test_main_survives_unexpected_error_without_leaking_it(
@@ -389,7 +523,7 @@ def test_main_survives_unexpected_error_without_leaking_it(
 ) -> None:
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("inesperado", "App inesperado")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert bot.load_pending()["inesperado"]["attempts"] == 1
     err = capsys.readouterr().err
@@ -397,7 +531,7 @@ def test_main_survives_unexpected_error_without_leaking_it(
     assert "sigiloso" not in err
 
 
-def test_main_keeps_job_pending_when_alert_fails(with_triage, monkeypatch) -> None:
+def test_main_keeps_job_pending_when_alert_fails(workdir, monkeypatch) -> None:
     messages: list[str] = []
 
     def fake_send(_token, _chat_id, text):
@@ -408,27 +542,25 @@ def test_main_keeps_job_pending_when_alert_fails(with_triage, monkeypatch) -> No
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
 
     with pytest.raises(SystemExit) as exc:
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert exc.value.code == 1
     assert len(messages) == bot.TELEGRAM_SEND_ATTEMPTS
     # Retried next run, whole alert, with nothing else stored
     assert bot.load_seen() == set()
-    assert bot.load_pending() == {
-        "x": {"title": "App novo", "url": "https://www.workana.com/job/x", "attempts": 0}
-    }
+    assert bot.load_pending() == {"x": _queued("x", "App novo", bot.JobStatus.TRIAGE)}
 
 
 def test_main_stops_triage_after_deadline(with_triage, sent, monkeypatch) -> None:
-    clock = iter([0.0, bot.PROPOSAL_DEADLINE_SECONDS + 1])
+    clock = iter([0.0, bot.TRIAGE_DEADLINE_SECONDS + 1])
     monkeypatch.setattr(bot.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(bot, "fetch_projects", lambda: [_project("x", "App novo")])
 
-    bot.main()
+    bot.main(MONITOR_ARGV)
 
     assert with_triage == []
     assert sent == []
-    assert bot.load_pending()["x"]["attempts"] == 0
+    assert bot.load_pending() == {"x": _queued("x", "App novo", bot.JobStatus.TRIAGE)}
 
 
 def test_split_message_respects_limit() -> None:
@@ -494,11 +626,23 @@ def test_send_with_retry_gives_up_at_once_on_bad_request(monkeypatch) -> None:
 def test_format_notification_escapes_title_and_error() -> None:
     project = _project("x", "App <b>&</b>")
 
-    assert bot.format_notification(project, None) == (
+    assert bot.format_notification(project, None, None) == (
         "🆕 <b>App &lt;b&gt;&amp;&lt;/b&gt;</b>\nhttps://www.workana.com/job/x"
     )
-    assert bot.format_notification(project, "falha <i>").endswith(
+    assert bot.format_notification(project, None, "falha <i>").endswith(
         "\n\n⚠️ Proposta não gerada: falha &lt;i&gt;"
+    )
+
+
+def test_format_notification_shows_price_and_deadline() -> None:
+    proposal = bot.Proposal(folder="f", price="R$ <6 000>", deadline="1 dia & 3 semanas")
+
+    text = bot.format_notification(_project("x", "App"), proposal, "ignorado")
+
+    # The proposal wins over an error; the link to proposta.md comes in step 08
+    assert text == (
+        "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
+        "💰 <b>Preço:</b> R$ &lt;6 000&gt;\n⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas"
     )
 
 
@@ -778,6 +922,231 @@ def test_generate_proposal_cleans_folder_on_failure(
     assert list(bot.GENERATED_DIR.iterdir()) == []
 
 
+AGENT_PROPOSAL = bot.Proposal(
+    folder="2026-10-07-10-00-workana-app-a", price="R$ 6 000", deadline="1 dia + 3 semanas"
+)
+AGENT_ALERT_TAIL = "\n\n💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas"
+
+
+@pytest.fixture
+def with_agent(skill, monkeypatch):
+    """proposal.yml's setup: OAuth token, the skill (from the skill fixture) and the claude CLI.
+
+    Returns (token, skill text, job id, description) for each generate_proposal call. The
+    agent fails on jobs whose title has "erro".
+    """
+    with bot.ENV_FILE.open("a") as f:
+        f.write("CLAUDE_CODE_OAUTH_TOKEN=oauth-test\n")
+    calls: list[tuple[str, str, str, str]] = []
+
+    def fake_generate_proposal(oauth_token, skill_text, project, description):
+        calls.append((oauth_token, skill_text, project["id"], description))
+        if "erro" in project["title"]:
+            raise ValueError("saída do agente com texto sigiloso")
+        return AGENT_PROPOSAL
+
+    monkeypatch.setattr(bot, "generate_proposal", fake_generate_proposal)
+    monkeypatch.setattr(bot.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    return calls
+
+
+def test_pending_roundtrip_keeps_status_description_and_proposal(workdir) -> None:
+    pending = {
+        "a": _queued(
+            "a",
+            "App a",
+            bot.JobStatus.ALERT,
+            attempts=1,
+            description="descrição",
+            proposal=AGENT_PROPOSAL,
+        ),
+        "b": _queued("b", "App b", bot.JobStatus.TRIAGE),
+    }
+
+    bot.save_pending(pending)
+
+    # On disk, the outside spelling: status as text, proposal as an object
+    stored = json.loads(bot.PENDING_FILE.read_text())
+    assert stored["a"]["status"] == "alert"
+    assert stored["a"]["proposal"] == {
+        "folder": "2026-10-07-10-00-workana-app-a",
+        "price": "R$ 6 000",
+        "deadline": "1 dia + 3 semanas",
+    }
+    assert stored["b"] == {
+        "title": "App b",
+        "url": "https://www.workana.com/job/b",
+        "status": "triage",
+        "attempts": 0,
+    }
+    # save_pending left the queue in memory typed
+    assert pending["a"]["status"] is bot.JobStatus.ALERT
+    loaded = bot.load_pending()
+    assert loaded == pending
+    assert loaded["a"]["status"] is bot.JobStatus.ALERT
+    assert loaded["a"]["proposal"] == AGENT_PROPOSAL
+
+
+def test_job_status_from_api_falls_back_to_triage(workdir, capsys) -> None:
+    for status in bot.JobStatus:
+        assert bot.JobStatus.from_api(status.value, "job-1") is status
+    assert capsys.readouterr().err == ""
+    bot.PENDING_FILE.write_text(
+        json.dumps(
+            {
+                "job-42": {"title": "App", "url": "u", "status": "revisao-secreta", "attempts": 1},
+                "job-43": {"title": "App", "url": "u", "attempts": 0},
+            }
+        )
+    )
+
+    pending = bot.load_pending()
+
+    assert pending["job-42"]["status"] is bot.JobStatus.TRIAGE
+    assert pending["job-43"]["status"] is bot.JobStatus.TRIAGE
+    err = capsys.readouterr().err
+    assert "job-42" in err and "job-43" in err
+    # Only the id: the raw value may be anything a hand edit put there
+    assert "revisao-secreta" not in err
+
+
+def test_propose_handles_one_job_per_run(with_agent, sent) -> None:
+    bot.save_pending(
+        {
+            "a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a"),
+            "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b"),
+        }
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    # Oldest first, one agent call per run
+    assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}"]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {
+        "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
+    }
+
+
+def test_propose_sends_alert_status_first_without_agent(with_agent, sent) -> None:
+    bot.save_pending(
+        {
+            "a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a"),
+            "b": _queued(
+                "b", "App b", bot.JobStatus.ALERT, description="descrição b", proposal=AGENT_PROPOSAL
+            ),
+        }
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    # b only missed its alert: it goes first, with no agent call, though a is older
+    assert sent == [
+        f"🆕 <b>App b</b>\nhttps://www.workana.com/job/b{AGENT_ALERT_TAIL}",
+        f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}",
+    ]
+    assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert bot.load_seen() == {"a", "b"}
+    assert bot.load_pending() == {}
+
+
+def test_propose_keeps_written_proposal_when_alert_fails(with_agent, sent) -> None:
+    bot.save_pending(
+        {"a": _queued("a", "App FALHA", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(PROPOSE_ARGV)
+
+    assert exc.value.code == 1
+    assert len(with_agent) == 1
+    assert sent == []
+    # The next run sends only the alert, without a second agent call
+    assert bot.load_pending() == {
+        "a": _queued(
+            "a",
+            "App FALHA",
+            bot.JobStatus.ALERT,
+            description="descrição a",
+            proposal=AGENT_PROPOSAL,
+        )
+    }
+    assert bot.load_seen() == set()
+
+
+def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, capsys) -> None:
+    bot.save_pending(
+        {"a": _queued("a", "App com erro", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == []
+    assert bot.load_pending() == {
+        "a": _queued(
+            "a", "App com erro", bot.JobStatus.PROPOSAL, attempts=1, description="descrição a"
+        )
+    }
+
+    for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
+        bot.main(PROPOSE_ARGV)
+
+    assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
+    assert sent == [
+        "🆕 <b>App com erro</b>\nhttps://www.workana.com/job/a\n\n"
+        "⚠️ Proposta não gerada: erro ao gerar a proposta"
+    ]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+    err = capsys.readouterr().err
+    assert "ValueError" in err
+    assert "sigiloso" not in err
+
+
+@pytest.mark.parametrize(
+    ("drop", "message"),
+    [
+        (_drop_skill, "Skill proposta-freela não encontrada"),
+        (_drop_token, "Falta CLAUDE_CODE_OAUTH_TOKEN"),
+        (_drop_claude, "Claude Code não instalado"),
+    ],
+    ids=["no-skill", "no-token", "no-claude"],
+)
+def test_propose_without_skill_counts_attempt(
+    with_agent, sent, monkeypatch, capsys, drop, message
+) -> None:
+    drop(monkeypatch)
+    bot.save_pending(
+        {
+            "a": _queued("a", "App a", bot.JobStatus.PROPOSAL, description="descrição a"),
+            "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b"),
+        }
+    )
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == []
+    assert message in capsys.readouterr().err
+    # Only the oldest job pays the try, so the queue still moves
+    pending = bot.load_pending()
+    assert (pending["a"]["attempts"], pending["b"]["attempts"]) == (1, 0)
+
+    for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
+        bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == [
+        "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
+        "⚠️ Proposta não gerada: erro ao gerar a proposta"
+    ]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {
+        "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
+    }
+
+
 def test_check_fit_uses_fit_prompt_file(workdir, monkeypatch) -> None:
     calls = _fake_claude(
         monkeypatch, output={"structured_output": {"is_match": False}}
@@ -926,7 +1295,7 @@ def test_main_saves_seen_after_each_alert(workdir, monkeypatch) -> None:
     )
 
     with pytest.raises(KeyboardInterrupt):
-        bot.main()
+        bot.main(MONITOR_ARGV)
 
     assert saved[1] == {"a"}
     # "b" never got its alert out but is still queued, even if it leaves the listing
