@@ -648,13 +648,34 @@ def test_format_notification_shows_price_deadline_and_link() -> None:
     assert text == (
         "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
         "💰 <b>Preço:</b> R$ &lt;6 000&gt;\n⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas\n"
-        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
-        '2026-10-07-10-00-workana-app/proposta.md">Proposta</a>'
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app">Proposta e análise</a>'
     )
     # Not on GitHub yet: a warning in place of a link that would not open
     unpublished = bot.format_notification(_project("x", "App"), proposal, None)
     assert unpublished.endswith(
         "⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas\n⚠️ Proposta gravada, mas não subiu para o GitHub."
+    )
+    assert "github.com" not in unpublished
+
+
+def test_format_notification_flags_unpriced_proposal() -> None:
+    proposal = bot.Proposal(
+        folder="2026-10-07-10-00-workana-app", price="a definir", deadline="a definir", priced=False
+    )
+
+    text = bot.format_notification(_project("x", "App"), proposal, None, published=True)
+
+    assert text == (
+        "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
+        "💰 <b>Sem preço:</b> vaga aberta demais. A proposta pede detalhes antes do valor.\n"
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app">Proposta e análise</a>'
+    )
+    # Not on GitHub yet: the push warning still follows the unpriced line
+    unpublished = bot.format_notification(_project("x", "App"), proposal, None)
+    assert unpublished.endswith(
+        "antes do valor.\n⚠️ Proposta gravada, mas não subiu para o GitHub."
     )
     assert "github.com" not in unpublished
 
@@ -737,7 +758,7 @@ def test_call_claude_raises_without_structured_output(monkeypatch) -> None:
 
 SKILL_TEXT = "# proposta-freela de teste\nSiga os Passos 1 a 5."
 AGENT_FILES = {bot.PROPOSAL_FILE: "Proposta.", bot.ANALYSIS_FILE: "Análise."}
-AGENT_SUMMARY = {"price": "R$ 6 000", "deadline": "1 dia + 3 semanas"}
+AGENT_SUMMARY = {"priced": True, "price": "R$ 6 000", "deadline": "1 dia + 3 semanas"}
 
 
 @pytest.fixture
@@ -759,9 +780,10 @@ def _fake_agent(
     files: dict[str, str] | None = None,
     returncode: int = 0,
     error: Exception | None = None,
+    summary: dict | None = None,
 ) -> list[dict]:
     """Fakes the agent: writes `files` (AGENT_FILES by default) in its cwd, then answers
-    AGENT_SUMMARY or raises `error`."""
+    `summary` (AGENT_SUMMARY by default) or raises `error`."""
     written = AGENT_FILES if files is None else files
     calls: list[dict] = []
 
@@ -772,7 +794,8 @@ def _fake_agent(
         if error is not None:
             raise error
         return SimpleNamespace(
-            returncode=returncode, stdout=json.dumps({"structured_output": AGENT_SUMMARY})
+            returncode=returncode,
+            stdout=json.dumps({"structured_output": summary or AGENT_SUMMARY}),
         )
 
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
@@ -849,8 +872,9 @@ def test_generate_proposal_runs_agent_with_restricted_tools(skill, monkeypatch) 
     # The skill as it is, as the system prompt; the bot's rules only say how it runs
     assert _flag(cmd, "--system-prompt") == SKILL_TEXT
     instructions = _flag(cmd, "--append-system-prompt")
-    assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder)
+    assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder, unpriced=bot.UNPRICED)
     assert str(folder) in instructions and "Pule o Passo 5" in instructions
+    assert f"`priced` false e `{bot.UNPRICED}` nos dois" in instructions
     assert _flag(cmd, "--tools") == "Read,Write,Edit,Bash"
     home_skill = bot.SKILL_DIR.as_posix().lstrip("/")
     real_skill = skill.resolve().as_posix().lstrip("/")
@@ -910,6 +934,16 @@ def test_agent_runs_with_minimal_env(skill, monkeypatch) -> None:
     assert "ANTHROPIC_API_KEY" not in env and "GITHUB_TOKEN" not in env
 
 
+def test_generate_proposal_keeps_unpriced_flag(skill, monkeypatch) -> None:
+    unpriced = {"priced": False, "price": bot.UNPRICED, "deadline": bot.UNPRICED}
+    _fake_agent(monkeypatch, summary=unpriced)
+
+    proposal = bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    # Proposal.priced defaults to True: only passing the agent's answer on gets False here
+    assert proposal.priced is False
+
+
 @pytest.mark.parametrize(
     ("files", "returncode", "error", "match"),
     [
@@ -942,13 +976,10 @@ AGENT_PROPOSAL = bot.Proposal(
 
 def _alert_tail(proposal: bot.Proposal) -> str:
     """The alert's lines after the job link, for a proposal that reached GitHub."""
-    link = (
-        "https://github.com/leandrorochaadm/proposta/blob/main/generated/"
-        f"{proposal.folder}/proposta.md"
-    )
+    folder = f"https://github.com/leandrorochaadm/proposta/tree/main/generated/{proposal.folder}"
     return (
         f"\n\n💰 <b>Preço:</b> {proposal.price}\n⏱ <b>Prazo:</b> {proposal.deadline}"
-        f'\n📄 <a href="{link}">Proposta</a>'
+        f'\n📁 <a href="{folder}">Proposta e análise</a>'
     )
 
 
@@ -1027,6 +1058,7 @@ def test_pending_roundtrip_keeps_status_description_and_proposal(workdir) -> Non
         "folder": "2026-10-07-10-00-workana-app-a",
         "price": "R$ 6 000",
         "deadline": "1 dia + 3 semanas",
+        "priced": True,
     }
     assert stored["b"] == {
         "title": "App b",
@@ -1040,6 +1072,25 @@ def test_pending_roundtrip_keeps_status_description_and_proposal(workdir) -> Non
     assert loaded == pending
     assert loaded["a"]["status"] is bot.JobStatus.ALERT
     assert loaded["a"]["proposal"] == AGENT_PROPOSAL
+
+
+def test_pending_proposal_without_priced_loads_as_priced(workdir) -> None:
+    # Written before the field existed: those alerts always showed a price
+    bot.PENDING_FILE.write_text(
+        json.dumps(
+            {
+                "a": {
+                    "title": "App a",
+                    "url": "u",
+                    "status": "alert",
+                    "attempts": 0,
+                    "proposal": {"folder": "f", "price": "R$ 1 000", "deadline": "1 dia"},
+                }
+            }
+        )
+    )
+
+    assert bot.load_pending()["a"]["proposal"].priced is True
 
 
 def test_job_status_from_api_falls_back_to_triage(workdir, capsys) -> None:
@@ -1172,6 +1223,7 @@ def test_alert_has_proposal_link(with_agent, published, sent) -> None:
                         "folder": "2026-10-07-10-00-workana-app-a",
                         "price": "R$ 6 000",
                         "deadline": "1 dia + 3 semanas",
+                        "priced": True,
                     },
                 }
             },
@@ -1181,8 +1233,8 @@ def test_alert_has_proposal_link(with_agent, published, sent) -> None:
     assert sent == [
         "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
         "💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas\n"
-        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
-        '2026-10-07-10-00-workana-app-a/proposta.md">Proposta</a>'
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app-a">Proposta e análise</a>'
     ]
     assert bot.load_seen() == {"a"}
     assert bot.load_pending() == {}

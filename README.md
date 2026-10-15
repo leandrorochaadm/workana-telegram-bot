@@ -189,9 +189,11 @@ https://www.workana.com/job/...
 
 💰 Preço: R$ 6 000
 ⏱ Prazo: 1 dia + 3 semanas
-📄 Proposta   (link para generated/<pasta>/proposta.md no GitHub)
+📁 Proposta e análise   (link para a pasta generated/<pasta>/ no GitHub, com proposta.md e analise.md)
 ```
 
+- Vaga aberta demais para orçar vem com `💰 Sem preço: vaga aberta demais. A proposta pede
+  detalhes antes do valor.` no lugar de Preço e Prazo; o motivo está no `analise.md`.
 - O link só abre com login na conta dona do `proposta` (repositório privado), também no celular.
 - Se o push da proposta falhar, no lugar do link vem `⚠️ Proposta gravada, mas não subiu para o
   GitHub.`. O fim do workflow tenta o push de novo.
