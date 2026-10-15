@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from pydantic import ValidationError
 
 import bot
 
@@ -74,6 +75,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "REJECTED_FILE", data / "rejected.json")
     monkeypatch.setattr(bot, "FIT_PROMPT_FILE", fit_prompt)
     monkeypatch.setattr(bot, "GENERATED_DIR", proposta / "generated")
+    monkeypatch.setattr(bot, "LOGS_DIR", proposta / "logs")
     # Never the developer's own ~/.claude skill: missing unless the skill fixture sets it up
     skill_dir = tmp_path / "home" / ".claude" / "skills" / "proposta-freela"
     monkeypatch.setattr(bot, "SKILL_DIR", skill_dir)
@@ -799,9 +801,11 @@ def _fake_agent(
     returncode: int = 0,
     error: Exception | None = None,
     summary: dict | None = None,
+    cli_fields: dict | None = None,
 ) -> list[dict]:
     """Fakes the agent: writes `files` (AGENT_FILES by default) in its cwd, then answers
-    `summary` (AGENT_SUMMARY by default) or raises `error`."""
+    `summary` (AGENT_SUMMARY by default) or raises `error`. `cli_fields` are extra
+    fields of the CLI's JSON output."""
     written = AGENT_FILES if files is None else files
     calls: list[dict] = []
 
@@ -813,7 +817,9 @@ def _fake_agent(
             raise error
         return SimpleNamespace(
             returncode=returncode,
-            stdout=json.dumps({"structured_output": summary or AGENT_SUMMARY}),
+            stdout=json.dumps(
+                {"structured_output": summary or AGENT_SUMMARY, **(cli_fields or {})}
+            ),
             stderr="",
         )
 
@@ -983,9 +989,156 @@ def test_generate_proposal_cleans_folder_on_failure(
     with pytest.raises(expected, match=match):
         bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
 
-    # The run's folder is gone, with whatever the agent left in it
+    # The half-written folder moved to LOGS_DIR with the reason for the failure
     assert bot.GENERATED_DIR.is_dir()
     assert list(bot.GENERATED_DIR.iterdir()) == []
+    [log] = list(bot.LOGS_DIR.iterdir())
+    assert log.name.endswith("-workana-app-novo")
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    if files and set(files) == {bot.PROPOSAL_FILE}:
+        assert (log / bot.PROPOSAL_FILE).read_text() == "Proposta."
+    if error is not None:
+        assert failure["error"] == "TimeoutExpired"
+    if returncode == 1:
+        assert failure["returncode"] == 1
+
+
+def test_generate_proposal_logs_missing_files(skill, monkeypatch, capsys) -> None:
+    _fake_agent(
+        monkeypatch,
+        files={},
+        cli_fields={
+            "num_turns": 7,
+            "permission_denials": [{"tool_name": "Write"}],
+            "result": "Resumo sem arquivos",
+        },
+    )
+
+    with pytest.raises(bot.ProposalError, match="não gravou"):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    assert list(bot.GENERATED_DIR.iterdir()) == []
+    [log] = list(bot.LOGS_DIR.iterdir())
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    assert "não gravou" in failure["error"]
+    assert failure["num_turns"] == 7
+    assert failure["permission_denials"] == [{"tool_name": "Write"}]
+    assert failure["result"] == "Resumo sem arquivos"
+    assert failure["returncode"] is None
+    captured = capsys.readouterr()
+    assert "Resumo sem arquivos" not in captured.out
+    assert "Resumo sem arquivos" not in captured.err
+
+
+def test_generate_proposal_removes_folder_when_log_fails(skill, monkeypatch, capsys) -> None:
+    _fake_agent(monkeypatch, files={})
+
+    def broken_log(*args, **kwargs):
+        raise OSError("disco sigiloso")
+
+    monkeypatch.setattr(bot, "write_failure_log", broken_log)
+
+    with pytest.raises(bot.ProposalError, match="não gravou"):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    assert list(bot.GENERATED_DIR.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "Falha ao gravar o log da proposta: OSError" in err
+    assert "disco sigiloso" not in err
+
+
+def test_generate_proposal_logs_invalid_output_by_class_name(skill, monkeypatch) -> None:
+    _fake_agent(monkeypatch, summary={"price": "R$ 1"})
+
+    with pytest.raises(ValidationError):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    [log] = list(bot.LOGS_DIR.iterdir())
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["error"] == "ValidationError"
+    assert failure["result"] is None
+
+
+def _failed_folder(name: str = "2026-10-15-10-00-workana-x") -> Path:
+    folder = bot.GENERATED_DIR / name
+    folder.mkdir(parents=True)
+    return folder
+
+
+def test_write_failure_log_moves_folder_and_redacts_token(workdir) -> None:
+    folder = _failed_folder()
+    (folder / bot.PROPOSAL_FILE).write_text("Proposta.")
+    project = {"id": "x", **_queued("x", "App novo", bot.JobStatus.PROPOSAL, attempts=1)}
+    error = bot.ProposalError(
+        "claude saiu com código 1",
+        details={
+            "returncode": 1,
+            "stderr": "falhou com oauth-tok",
+            "output": {
+                "subtype": "error_max_turns",
+                "num_turns": 12,
+                "duration_ms": 50_000,
+                "total_cost_usd": 0.4,
+                "permission_denials": [{"tool_input": {"command": "echo oauth-tok"}}],
+                "result": "oauth-tok " + "x" * bot.LOG_FIELD_MAX_CHARS,
+            },
+        },
+    )
+
+    target = bot.write_failure_log(folder, project, error, "oauth-tok")
+
+    assert target == bot.LOGS_DIR / folder.name
+    assert not folder.exists()
+    assert (target / bot.PROPOSAL_FILE).read_text() == "Proposta."
+    raw = (target / bot.FAILURE_LOG_FILE).read_text()
+    failure = json.loads(raw)
+    assert failure["status"] == "proposal"
+    assert failure["attempts"] == 2
+    assert failure["retries"] == 0
+    assert failure["error"] == "claude saiu com código 1"
+    assert failure["returncode"] == 1
+    assert len(failure["result"]) == bot.LOG_FIELD_MAX_CHARS
+    assert failure["result"].startswith("*** ")
+    assert "oauth-tok" not in raw
+    assert "***" in failure["stderr"]
+    assert "***" in json.dumps(failure["permission_denials"])
+
+    bare = bot.write_failure_log(
+        _failed_folder("2026-10-15-10-01-workana-y"), _project("y", "Sem status"), error, "oauth-tok"
+    )
+    failure = json.loads((bare / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["status"] is None
+    assert failure["attempts"] == 1
+    assert failure["retries"] == 0
+
+
+def test_write_failure_log_creates_missing_folder_and_avoids_collision(workdir) -> None:
+    folder = bot.GENERATED_DIR / "2026-10-15-10-00-workana-x"
+    error = bot.ProposalError("falhou")
+
+    first = bot.write_failure_log(folder, _project("x", "App"), error, "")
+    second = bot.write_failure_log(folder, _project("x", "App"), error, "")
+
+    assert [p.name for p in first.iterdir()] == [bot.FAILURE_LOG_FILE]
+    assert second == bot.LOGS_DIR / f"{folder.name}-2"
+    assert [p.name for p in first.iterdir()] == [bot.FAILURE_LOG_FILE]
+    assert json.loads((second / bot.FAILURE_LOG_FILE).read_text())["error"] == "falhou"
+
+
+def test_write_failure_log_keeps_timeout_partial_output(workdir) -> None:
+    error = subprocess.TimeoutExpired("claude", 1200, output=b"parcial \xff", stderr=b"oauth-tok erro")
+    target = bot.write_failure_log(_failed_folder(), _project("x", "App"), error, "oauth-tok")
+    failure = json.loads((target / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["stdout"] == "parcial \ufffd"
+    assert failure["stderr"] == "*** erro"
+    assert failure["error"] == "TimeoutExpired"
+    assert failure["returncode"] is None
+
+    empty = subprocess.TimeoutExpired("claude", 1200, output=None, stderr=None)
+    target = bot.write_failure_log(_failed_folder("outra"), _project("x", "App"), empty, "oauth-tok")
+    failure = json.loads((target / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["stdout"] is None
+    assert failure["stderr"] is None
 
 
 AGENT_PROPOSAL = bot.Proposal(

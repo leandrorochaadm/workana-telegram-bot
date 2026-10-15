@@ -54,6 +54,8 @@ LOGS_DIR = PROPOSTA_DIR / "logs"
 FAILURE_LOG_FILE = "failure.json"
 # Cut of each long text in the failure log
 LOG_FIELD_MAX_CHARS = 20_000
+# What of the CLI's JSON output explains why the agent stopped
+CLI_LOG_FIELDS = ("subtype", "num_turns", "duration_ms", "total_cost_usd", "permission_denials", "result")
 # Where the alert links: proposta's default branch on GitHub, the one the workflows push to
 PROPOSTA_TREE_URL = "https://github.com/leandrorochaadm/proposta/tree/main"
 # The proposta-freela skill, a symlink proposal.yml points at the dotfiles checkout: the
@@ -501,13 +503,70 @@ def _has_text(path: Path) -> bool:
     return path.is_file() and path.read_text().strip() != ""
 
 
+def _log_text(value: bytes | str | None, oauth_token: str) -> str | None:
+    """Decodes, hides the token and cuts to LOG_FIELD_MAX_CHARS (in this order)."""
+    if value is None:
+        return None
+    text = value.decode(errors="replace") if isinstance(value, bytes) else value
+    if oauth_token:
+        text = text.replace(oauth_token, "***")
+    return text[:LOG_FIELD_MAX_CHARS]
+
+
+def write_failure_log(
+    folder: Path, project: dict, error: Exception, oauth_token: str
+) -> Path:
+    """Moves the half-written `folder` to LOGS_DIR and writes FAILURE_LOG_FILE in it.
+
+    The log goes to the private repo, never to stdout/stderr (the Actions log is public).
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    target = LOGS_DIR / folder.name
+    suffix = 2
+    while target.exists():
+        target = LOGS_DIR / f"{folder.name}-{suffix}"
+        suffix += 1
+    if folder.exists():
+        shutil.move(folder, target)
+    else:
+        target.mkdir()
+
+    is_proposal_error = isinstance(error, ProposalError)
+    details = error.details if isinstance(error, ProposalError) else {}
+    output = details.get("output") or {}
+    status = project.get("status")
+    log = {
+        "url": project["url"],
+        "title": project["title"],
+        "status": status.value if status else None,
+        "attempts": project.get("attempts", 0) + 1,
+        "retries": project.get("retries", 0),
+        "error": str(error) if is_proposal_error else type(error).__name__,
+        "returncode": details.get("returncode"),
+    }
+    for field in CLI_LOG_FIELDS:
+        value = output.get(field)
+        log[field] = _log_text(value, oauth_token) if field == "result" else value
+    log["stderr"] = _log_text(details.get("stderr"), oauth_token)
+    if isinstance(error, subprocess.TimeoutExpired):
+        log["stdout"] = _log_text(error.stdout, oauth_token)
+        log["stderr"] = _log_text(error.stderr, oauth_token)
+
+    text = json.dumps(log, ensure_ascii=False, indent=2) + "\n"
+    if oauth_token:
+        text = text.replace(oauth_token, "***")
+    (target / FAILURE_LOG_FILE).write_text(text)
+    return target
+
+
 def generate_proposal(
     oauth_token: str, skill: str, project: dict[str, str], description: str
 ) -> Proposal:
     """Runs the proposta-freela skill as an agent that writes the proposal in a new folder.
 
-    `skill` is the SKILL.md text. Any failure, a timeout included, removes the folder
-    before going up, so a half-written proposal is never committed.
+    `skill` is the SKILL.md text. Any failure, a timeout included, moves the folder to
+    LOGS_DIR with FAILURE_LOG_FILE before going up (removed only if the log fails), so
+    GENERATED_DIR never holds a half-written proposal.
     """
     folder = proposal_folder(project["title"], datetime.now(UTC))
     folder.mkdir(parents=True)
@@ -529,9 +588,16 @@ def generate_proposal(
         )
         summary = ProposalSummary.model_validate(output["structured_output"])
         if not all(_has_text(folder / name) for name in (PROPOSAL_FILE, ANALYSIS_FILE)):
-            raise ProposalError("agente não gravou os arquivos da proposta")
-    except Exception:
-        shutil.rmtree(folder, ignore_errors=True)
+            raise ProposalError(
+                "agente não gravou os arquivos da proposta", details={"output": output}
+            )
+    except Exception as exc:
+        try:
+            write_failure_log(folder, project, exc, oauth_token)
+        except Exception as log_exc:  # noqa: BLE001
+            # The agent's failure is the one that matters; the log is the extra
+            shutil.rmtree(folder, ignore_errors=True)
+            print(f"Falha ao gravar o log da proposta: {type(log_exc).__name__}", file=sys.stderr)
         raise
     return Proposal(
         folder=folder.name, price=summary.price, deadline=summary.deadline, priced=summary.priced
