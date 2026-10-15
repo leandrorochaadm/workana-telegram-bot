@@ -40,7 +40,7 @@ PROPOSTA_DIR = BASE_DIR / "proposta"
 DATA_DIR = PROPOSTA_DIR / "data"
 SEEN_FILE = DATA_DIR / "seen.json"
 # Matched jobs not alerted yet: {id: {"title", "url", "status", "attempts", "description"?,
-# "proposal"?}}; see JobStatus
+# "proposal"?, "failed_at"? (ISO 8601, UTC), "retries"?}}; see JobStatus
 PENDING_FILE = DATA_DIR / "pending.json"
 # Jobs the triage turned down, kept to tune the triage prompt: {id: {"title", "url", "date"}}
 REJECTED_FILE = DATA_DIR / "rejected.json"
@@ -48,6 +48,12 @@ REJECTED_FILE = DATA_DIR / "rejected.json"
 FIT_PROMPT_FILE = PROPOSTA_DIR / "prompts" / "fit_prompt.md"
 # One folder per proposal, next to the ones written by hand with the same skill
 GENERATED_DIR = PROPOSTA_DIR / "generated"
+# Agent failures go here, in the private repo, never to the public Actions log
+LOGS_DIR = PROPOSTA_DIR / "logs"
+# The file that describes the failure inside each folder of LOGS_DIR
+FAILURE_LOG_FILE = "failure.json"
+# Cut of each long text in the failure log
+LOG_FIELD_MAX_CHARS = 20_000
 # Where the alert links: proposta's default branch on GitHub, the one the workflows push to
 PROPOSTA_TREE_URL = "https://github.com/leandrorochaadm/proposta/tree/main"
 # The proposta-freela skill, a symlink proposal.yml points at the dotfiles checkout: the
@@ -121,6 +127,13 @@ TRIAGE_DEADLINE_SECONDS = 5 * 60
 # Tries of one job, reading its page (monitor) or writing its proposal (propose), before
 # the alert goes out without a proposal, so a job cannot cost every run forever
 MAX_JOB_ATTEMPTS = 3
+# A failed job is tried again every 6 h, up to 8 times (about 2 days); past that it stays
+# failed until released by hand
+FAILED_RETRY_HOURS = 6
+MAX_FAILED_RETRIES = 8
+# Alert text; with format_notification's prefix: "⚠️ Proposta não gerada: ficou na fila e o bot
+# tenta de novo em 6 h."
+PROPOSAL_FAILED_TEXT = "ficou na fila e o bot tenta de novo em {hours} h."
 # proposal.yml runs one agent per dispatch; the monitor dispatches again while the queue lasts
 MAX_PROPOSALS_PER_RUN = 1
 TELEGRAM_MAX_CHARS = 4096
@@ -154,7 +167,14 @@ PROPOSAL_COMMIT_MESSAGE = "chore: add workana proposal {folder}"
 
 
 class ProposalError(Exception):
-    """A failure whose message is safe for public logs: it never holds model output."""
+    """A failure whose message is safe for public logs: it never holds model output.
+
+    `details` holds the CLI's raw output and may only go to the private repo.
+    """
+
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 class JobFit(BaseModel):
@@ -194,6 +214,7 @@ class JobStatus(StrEnum):
     TRIAGE = "triage"  # matched the keywords, description and triage still to do
     PROPOSAL = "proposal"  # passed the triage, waiting for proposal.yml
     ALERT = "alert"  # proposal written (or given up), alert not sent yet
+    FAILED = "failed"  # proposal given up, alert sent; tried again every FAILED_RETRY_HOURS
 
     @classmethod
     def from_api(cls, raw: object, job_id: str) -> "JobStatus":
@@ -407,7 +428,7 @@ def check_fit(
         schema=JobFit,
         timeout=FIT_TIMEOUT_SECONDS,
     )
-    return JobFit.model_validate(output)
+    return JobFit.model_validate(output["structured_output"])
 
 
 def proposal_slug(title: str) -> str:
@@ -506,7 +527,7 @@ def generate_proposal(
             add_dirs=(SKILL_DIR,),
             cwd=folder,
         )
-        summary = ProposalSummary.model_validate(output)
+        summary = ProposalSummary.model_validate(output["structured_output"])
         if not all(_has_text(folder / name) for name in (PROPOSAL_FILE, ANALYSIS_FILE)):
             raise ProposalError("agente não gravou os arquivos da proposta")
     except Exception:
@@ -590,8 +611,8 @@ def call_claude(
 
     Without `tools` it is a plain answer, as the triage needs. With them it is an agent
     limited to the `allowed` permission rules, everything else denied, running from
-    `cwd` with only AGENT_ENV_KEYS in its environment. Returns the structured output,
-    still unvalidated.
+    `cwd` with only AGENT_ENV_KEYS in its environment. Returns the CLI's whole JSON
+    output; its structured_output is still unvalidated.
     """
     if tools:
         # The agent runs commands: nothing in reach but what it needs
@@ -643,9 +664,10 @@ def call_claude(
     if result.returncode != 0 or output.get("is_error") or output.get("structured_output") is None:
         raise ProposalError(
             f"claude saiu com código {result.returncode} (subtype={output.get('subtype')}, "
-            f"api_error_status={output.get('api_error_status')})"
+            f"api_error_status={output.get('api_error_status')})",
+            details={"returncode": result.returncode, "output": output, "stderr": result.stderr},
         )
-    return output["structured_output"]
+    return output
 
 
 def format_notification(

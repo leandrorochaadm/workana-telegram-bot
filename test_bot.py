@@ -681,7 +681,11 @@ def test_format_notification_flags_unpriced_proposal() -> None:
 
 
 def _fake_claude(
-    monkeypatch, returncode: int = 0, output: dict | None = None, outputs: list[dict] | None = None
+    monkeypatch,
+    returncode: int = 0,
+    output: dict | None = None,
+    outputs: list[dict] | None = None,
+    stderr: str = "",
 ) -> list[dict]:
     """Fakes the CLI; `outputs` answers call by call, repeating the last one."""
     calls: list[dict] = []
@@ -690,7 +694,7 @@ def _fake_claude(
     def fake_run(cmd, **kwargs):
         calls.append({"cmd": cmd, **kwargs})
         answer = answers[min(len(calls), len(answers)) - 1]
-        return SimpleNamespace(returncode=returncode, stdout=json.dumps(answer))
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(answer), stderr=stderr)
 
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
     return calls
@@ -712,7 +716,7 @@ def test_call_claude_runs_print_mode_without_api_key(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
     calls = _fake_claude(monkeypatch, output={"structured_output": {"is_match": True}})
 
-    assert _call_claude() == {"is_match": True}
+    assert _call_claude()["structured_output"] == {"is_match": True}
     cmd = calls[0]["cmd"]
     assert cmd[:2] == ["claude", "-p"]
     assert cmd[cmd.index("--model") + 1] == bot.FIT_MODEL
@@ -733,20 +737,34 @@ def test_call_claude_runs_print_mode_without_api_key(monkeypatch) -> None:
 
 def test_call_claude_raises_on_cli_failure(monkeypatch) -> None:
     _fake_claude(
-        monkeypatch, returncode=1, output={"is_error": True, "api_error_status": 401}
+        monkeypatch,
+        returncode=1,
+        output={"is_error": True, "api_error_status": 401},
+        stderr="erro sigiloso",
     )
 
-    with pytest.raises(bot.ProposalError, match="código 1.*api_error_status=401"):
+    with pytest.raises(bot.ProposalError, match="código 1.*api_error_status=401") as exc_info:
         _call_claude()
+
+    assert exc_info.value.details == {
+        "returncode": 1,
+        "output": {"is_error": True, "api_error_status": 401},
+        "stderr": "erro sigiloso",
+    }
+    assert "erro sigiloso" not in str(exc_info.value)
 
 
 def test_call_claude_raises_on_non_json_output(monkeypatch) -> None:
     monkeypatch.setattr(
-        bot.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="boom")
+        bot.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="boom", stderr=""),
     )
 
-    with pytest.raises(bot.ProposalError, match="código 1"):
+    with pytest.raises(bot.ProposalError, match="código 1") as exc_info:
         _call_claude()
+
+    assert exc_info.value.details["output"] == {}
 
 
 def test_call_claude_raises_without_structured_output(monkeypatch) -> None:
@@ -796,6 +814,7 @@ def _fake_agent(
         return SimpleNamespace(
             returncode=returncode,
             stdout=json.dumps({"structured_output": summary or AGENT_SUMMARY}),
+            stderr="",
         )
 
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
@@ -1096,6 +1115,7 @@ def test_pending_proposal_without_priced_loads_as_priced(workdir) -> None:
 def test_job_status_from_api_falls_back_to_triage(workdir, capsys) -> None:
     for status in bot.JobStatus:
         assert bot.JobStatus.from_api(status.value, "job-1") is status
+    assert bot.JobStatus.FAILED.value == "failed"
     assert capsys.readouterr().err == ""
     bot.PENDING_FILE.write_text(
         json.dumps(
