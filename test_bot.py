@@ -1506,6 +1506,29 @@ def test_alert_status_with_missing_folder_regenerates(with_agent, published, sen
     assert bot.load_pending() == {}
 
 
+FAILED_ALERT_TEXT = "⚠️ Proposta não gerada: ficou na fila e o bot tenta de novo em 6 h."
+
+
+def _due_failed(pid: str, title: str, retries: int = 0, **extra) -> dict:
+    """A FAILED job whose retry is due."""
+    return _queued(
+        pid,
+        title,
+        bot.JobStatus.FAILED,
+        description=f"descrição {pid}",
+        failed_at=datetime.now(UTC) - timedelta(hours=bot.FAILED_RETRY_HOURS + 1),
+        retries=retries,
+        **extra,
+    )
+
+
+def _assert_parked(job: dict, retries: int, since: datetime) -> None:
+    assert job["status"] is bot.JobStatus.FAILED
+    assert job["attempts"] == 0
+    assert job["retries"] == retries
+    assert since <= job["failed_at"] <= datetime.now(UTC)
+
+
 def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, capsys) -> None:
     bot.save_pending(
         {"a": _queued("a", "App com erro", bot.JobStatus.PROPOSAL, description="descrição a")}
@@ -1520,16 +1543,21 @@ def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, ca
         )
     }
 
+    before = datetime.now(UTC)
     for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
         bot.main(PROPOSE_ARGV)
 
     assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
-    assert sent == [
-        "🆕 <b>App com erro</b>\nhttps://www.workana.com/job/a\n\n"
-        "⚠️ Proposta não gerada: erro ao gerar a proposta"
-    ]
-    assert bot.load_seen() == {"a"}
-    assert bot.load_pending() == {}
+    assert sent == [f"🆕 <b>App com erro</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"]
+    assert bot.load_seen() == set()
+    pending = bot.load_pending()
+    _assert_parked(pending["a"], retries=0, since=before)
+    assert pending["a"]["description"] == "descrição a"
+    assert bot.has_queue(pending) is False
+    # Parked: the next run neither calls the agent nor alerts again
+    bot.main(PROPOSE_ARGV)
+    assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
+    assert len(sent) == 1
     err = capsys.readouterr().err
     assert "ValueError" in err
     assert "sigiloso" not in err
@@ -1564,18 +1592,16 @@ def test_propose_without_skill_counts_attempt(
     pending = bot.load_pending()
     assert (pending["a"]["attempts"], pending["b"]["attempts"]) == (1, 0)
 
+    before = datetime.now(UTC)
     for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
         bot.main(PROPOSE_ARGV)
 
     assert with_agent == []
-    assert sent == [
-        "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
-        "⚠️ Proposta não gerada: erro ao gerar a proposta"
-    ]
-    assert bot.load_seen() == {"a"}
-    assert bot.load_pending() == {
-        "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
-    }
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"]
+    assert bot.load_seen() == set()
+    pending = bot.load_pending()
+    _assert_parked(pending["a"], retries=0, since=before)
+    assert pending["b"] == _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1996,3 +2022,161 @@ def test_pending_roundtrip_keeps_failed_at_and_retries(workdir) -> None:
     assert isinstance(loaded["a"]["failed_at"], datetime)
     assert bot._pending_entry({"id": "f", **pending["f"]}) == pending["f"]
     assert pending["f"]["failed_at"] is failed_at
+
+
+def test_propose_parks_failed_only_after_alert_is_sent(with_agent, sent, monkeypatch) -> None:
+    bot.save_pending(
+        {"a": _queued("a", "App com erro FALHA", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+    for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
+        bot.main(PROPOSE_ARGV)
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(PROPOSE_ARGV)
+
+    assert exc.value.code == 1
+    assert sent == []
+    job = bot.load_pending()["a"]
+    assert job["status"] is bot.JobStatus.ALERT
+    assert job["attempts"] == bot.MAX_JOB_ATTEMPTS
+    assert "proposal" not in job and "failed_at" not in job
+    assert bot.load_seen() == set()
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, text: sent.append(text))
+    before = datetime.now(UTC)
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == [
+        f"🆕 <b>App com erro FALHA</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"
+    ]
+    assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
+    _assert_parked(bot.load_pending()["a"], retries=0, since=before)
+    assert bot.load_seen() == set()
+
+
+def test_propose_retries_failed_job_after_cooldown(with_agent, sent, capsys) -> None:
+    bot.save_pending({"a": _due_failed("a", "App a", retries=2)})
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}"]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+    bot.save_pending({"e": _due_failed("e", "App com erro", retries=2)})
+    sent.clear()
+    before = datetime.now(UTC)
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == []
+    _assert_parked(bot.load_pending()["e"], retries=3, since=before)
+    err = capsys.readouterr().err
+    assert "ValueError" in err
+    assert "sigiloso" not in err
+    calls = len(with_agent)
+    bot.main(PROPOSE_ARGV)
+    assert len(with_agent) == calls
+
+
+def test_propose_failed_retry_keeps_alert_when_telegram_fails(
+    with_agent, published, sent, monkeypatch
+) -> None:
+    bot.save_pending({"a": _due_failed("a", "App FALHA", retries=1)})
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(PROPOSE_ARGV)
+
+    assert exc.value.code == 1
+    job = bot.load_pending()["a"]
+    assert job["status"] is bot.JobStatus.ALERT
+    assert job["proposal"] == AGENT_PROPOSAL
+    assert job["retries"] == 1
+    assert bot.load_seen() == set()
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, text: sent.append(text))
+    bot.main(PROPOSE_ARGV)
+
+    assert len(with_agent) == 1
+    assert len(published.calls) == 1
+    assert len(sent) == 1
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+
+@pytest.mark.parametrize(
+    ("failed_at_hours", "retries"),
+    [(1, 0), (bot.FAILED_RETRY_HOURS + 1, bot.MAX_FAILED_RETRIES)],
+    ids=["cooling", "exhausted"],
+)
+def test_propose_skips_failed_job_not_due(with_agent, sent, failed_at_hours, retries) -> None:
+    job = _due_failed("a", "App a", retries=retries)
+    job["failed_at"] = datetime.now(UTC) - timedelta(hours=failed_at_hours)
+    bot.save_pending({"a": job})
+    saved = bot.load_pending()
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == []
+    assert bot.load_pending() == saved
+
+
+@pytest.mark.parametrize(
+    ("retries", "last"),
+    [(bot.MAX_FAILED_RETRIES - 2, False), (bot.MAX_FAILED_RETRIES - 1, True)],
+    ids=["before-last", "last"],
+)
+def test_propose_stops_retrying_after_max_failed_retries(
+    with_agent, sent, capsys, retries, last
+) -> None:
+    bot.save_pending({"a": _due_failed("a", "App com erro", retries=retries)})
+
+    bot.main(PROPOSE_ARGV)
+
+    job = bot.load_pending()["a"]
+    assert job["retries"] == retries + 1
+    assert job["status"] is bot.JobStatus.FAILED
+    message = "Vaga https://www.workana.com/job/a sem novas tentativas automáticas"
+    assert (message in capsys.readouterr().err) is last
+    if last:
+        later = datetime.now(UTC) + timedelta(hours=bot.FAILED_RETRY_HOURS + 1)
+        assert bot.retry_due(job, later) is False
+    assert sent == []
+
+
+def test_propose_without_skill_counts_failed_retry(
+    with_agent, sent, monkeypatch, capsys
+) -> None:
+    _drop_skill(monkeypatch)
+    bot.save_pending({"a": _due_failed("a", "App a")})
+    before = datetime.now(UTC)
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == []
+    _assert_parked(bot.load_pending()["a"], retries=1, since=before)
+    assert "Skill proposta-freela não encontrada" in capsys.readouterr().err
+
+
+def test_propose_prefers_new_job_over_failed_retry(with_agent, sent) -> None:
+    failed = _due_failed("f", "App f", retries=1)
+    bot.save_pending(
+        {
+            "f": failed,
+            "p": _queued("p", "App p", bot.JobStatus.PROPOSAL, description="descrição p"),
+        }
+    )
+    saved = bot.load_pending()["f"]
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == [("oauth-test", SKILL_TEXT, "p", "descrição p")]
+    assert bot.load_pending() == {"f": saved}
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent[-1][2] == "f"
+    assert bot.load_seen() == {"p", "f"}
+    assert bot.load_pending() == {}

@@ -232,7 +232,8 @@ class JobStatus(StrEnum):
             return cls.TRIAGE
 
 
-# What proposal.yml handles, in this order: an ALERT job only misses its alert
+# What proposal.yml handles, in this order: an ALERT job only misses its alert.
+# FAILED jobs are handled too, last and only when retry_due, so they stay out of this tuple
 PROPOSAL_RUN_STATUSES = (JobStatus.ALERT, JobStatus.PROPOSAL)
 
 
@@ -1060,7 +1061,8 @@ def run_monitor(
 
 def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
     """proposal.yml: sends the alerts left over, then writes the oldest queued proposal
-    with the agent, publishes it to the proposta repo and sends its alert."""
+    (or, with none queued, retries the oldest failed one that is due), publishes it to the
+    proposta repo and sends its alert."""
     skill = SKILL_FILE.read_text() if SKILL_FILE.is_file() else None
     # Counted as a failed try on the oldest job, so the queue never stalls for good
     blocker = None
@@ -1073,6 +1075,7 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
 
     seen = load_seen()
     pending = load_pending()
+    now = datetime.now(UTC)
 
     def save_state() -> None:
         save_seen(seen)
@@ -1102,13 +1105,18 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
         for pid, job in pending.items()
         if job["status"] is status
     ]
+    # FAILED jobs that are due come last: with MAX_PROPOSALS_PER_RUN = 1, a new job always
+    # goes ahead of a retry
+    candidates += [
+        {"id": pid, **job} for pid, job in pending.items() if retry_due(job, now)
+    ]
     proposals_left = MAX_PROPOSALS_PER_RUN
     sent = generated = unpublished = failed = deferred = 0
     try:
         for project in candidates:
             # A job already in ALERT has its folder in this fresh checkout, so on origin too
             published = True
-            if project["status"] is JobStatus.PROPOSAL:
+            if project["status"] in (JobStatus.PROPOSAL, JobStatus.FAILED):
                 if proposals_left <= 0:
                     # The rest waits for the next dispatch
                     break
@@ -1123,13 +1131,26 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
                     # Same rule as the monitor: only ProposalError is safe for the public logs
                     detail = str(exc) if isinstance(exc, ProposalError) else type(exc).__name__
                     print(f"Falha na proposta de {project['url']}: {detail}", file=sys.stderr)
+                    if project["status"] is JobStatus.FAILED:
+                        project["retries"] += 1
+                        project["failed_at"] = now
+                        pending[project["id"]] = _pending_entry(project)
+                        save_state()
+                        deferred += 1
+                        if project["retries"] == MAX_FAILED_RETRIES:
+                            print(
+                                f"Vaga {project['url']} sem novas tentativas automáticas",
+                                file=sys.stderr,
+                            )
+                        continue
                     project["attempts"] += 1
                     if project["attempts"] < MAX_JOB_ATTEMPTS:
                         pending[project["id"]] = _pending_entry(project)
                         save_state()
                         deferred += 1
                         continue
-                    # Given up: the alert goes out without a proposal
+                    # Given up: the alert goes out without a proposal and the job stays
+                    # in the queue as FAILED after it
                 else:
                     generated += 1
                 project["status"] = JobStatus.ALERT
@@ -1144,10 +1165,19 @@ def run_propose(token: str, chat_id: str, oauth_token: str | None) -> None:
                     if not published:
                         unpublished += 1
             proposal = project.get("proposal")
-            error = None if proposal else "erro ao gerar a proposta"
+            error = None if proposal else PROPOSAL_FAILED_TEXT.format(hours=FAILED_RETRY_HOURS)
             if _send_alert(token, chat_id, project, proposal, error, published=published):
-                seen.add(project["id"])
-                pending.pop(project["id"], None)
+                if proposal:
+                    seen.add(project["id"])
+                    pending.pop(project["id"], None)
+                else:
+                    # Parked, not dropped: retried every FAILED_RETRY_HOURS, behind new jobs.
+                    # Not in seen; the monitor already skips what is in pending
+                    project["status"] = JobStatus.FAILED
+                    project["failed_at"] = now
+                    project["attempts"] = 0
+                    project["retries"] = project.get("retries", 0)
+                    pending[project["id"]] = _pending_entry(project)
                 save_state()
                 sent += 1
             else:
