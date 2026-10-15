@@ -75,7 +75,9 @@ jobs:
         working-directory: proposta
         run: |
           git add data/pending.json data/seen.json
-          git diff --cached --quiet || git commit -m "chore: update proposal queue"
+          # logs/ only exists after the first agent failure; git add fails on a missing path
+          if [ -d logs ]; then git add logs; fi
+          git diff --cached --quiet || git commit -m "chore: update proposal queue and logs"
           # also pushes a proposal commit whose own push failed during the run
           git pull --rebase
           git push
