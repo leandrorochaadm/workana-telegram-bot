@@ -3,12 +3,13 @@ import os
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
+from pydantic import ValidationError
 
 import bot
 
@@ -74,6 +75,7 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "REJECTED_FILE", data / "rejected.json")
     monkeypatch.setattr(bot, "FIT_PROMPT_FILE", fit_prompt)
     monkeypatch.setattr(bot, "GENERATED_DIR", proposta / "generated")
+    monkeypatch.setattr(bot, "LOGS_DIR", proposta / "logs")
     # Never the developer's own ~/.claude skill: missing unless the skill fixture sets it up
     skill_dir = tmp_path / "home" / ".claude" / "skills" / "proposta-freela"
     monkeypatch.setattr(bot, "SKILL_DIR", skill_dir)
@@ -223,28 +225,74 @@ def test_main_skips_excluded_jobs_including_queued_ones(workdir, sent, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "extra", "expected"),
     [
-        (None, "false"),
+        (None, {}, "false"),
         # Without the triage the monitor alerts it at once: nothing left for proposal.yml
-        (bot.JobStatus.TRIAGE, "false"),
-        (bot.JobStatus.PROPOSAL, "true"),
-        (bot.JobStatus.ALERT, "true"),
+        (bot.JobStatus.TRIAGE, {}, "false"),
+        (bot.JobStatus.PROPOSAL, {}, "true"),
+        (bot.JobStatus.ALERT, {}, "true"),
+        (
+            bot.JobStatus.FAILED,
+            {"failed_at": datetime.now(UTC) - timedelta(hours=7), "retries": 0},
+            "true",
+        ),
+        (
+            bot.JobStatus.FAILED,
+            {"failed_at": datetime.now(UTC) - timedelta(hours=1), "retries": 0},
+            "false",
+        ),
+        (
+            bot.JobStatus.FAILED,
+            {
+                "failed_at": datetime.now(UTC) - timedelta(hours=7),
+                "retries": bot.MAX_FAILED_RETRIES,
+            },
+            "false",
+        ),
     ],
-    ids=["empty", "triage", "proposal", "alert"],
+    ids=["empty", "triage", "proposal", "alert", "failed-due", "failed-cooling", "failed-exhausted"],
 )
-def test_monitor_writes_has_queue_output(workdir, sent, monkeypatch, status, expected) -> None:
+def test_monitor_writes_has_queue_output(
+    workdir, sent, monkeypatch, status, extra, expected
+) -> None:
     output = workdir / "github_output"
     output.write_text("earlier=1\n")
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     if status is not None:
-        bot.save_pending({"x": _queued("x", "App novo", status)})
+        bot.save_pending({"x": _queued("x", "App novo", status, **extra)})
     monkeypatch.setattr(bot, "fetch_projects", lambda: [])
 
     bot.main(MONITOR_ARGV)
 
     # Appended: the file holds the other steps' outputs too
     assert output.read_text() == f"earlier=1\nhas_queue={expected}\n"
+
+
+def test_monitor_drops_failed_job_with_excluded_keyword(workdir, sent, monkeypatch) -> None:
+    with bot.ENV_FILE.open("a") as f:
+        f.write("EXCLUDE_KEYWORDS=jogo\n")
+    output = workdir / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    bot.save_pending(
+        {
+            "f": _queued(
+                "f",
+                "App de jogo",
+                bot.JobStatus.FAILED,
+                failed_at=datetime.now(UTC) - timedelta(hours=7),
+                retries=1,
+            )
+        }
+    )
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [])
+
+    bot.main(MONITOR_ARGV)
+
+    assert bot.load_pending() == {}
+    assert bot.load_seen() == {"f"}
+    assert sent == []
+    assert output.read_text() == "has_queue=false\n"
 
 
 def test_monitor_writes_has_queue_when_listing_fails(workdir, monkeypatch) -> None:
@@ -648,8 +696,8 @@ def test_format_notification_shows_price_deadline_and_link() -> None:
     assert text == (
         "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
         "💰 <b>Preço:</b> R$ &lt;6 000&gt;\n⏱ <b>Prazo:</b> 1 dia &amp; 3 semanas\n"
-        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
-        '2026-10-07-10-00-workana-app/proposta.md">Proposta</a>'
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app">Proposta e análise</a>'
     )
     # Not on GitHub yet: a warning in place of a link that would not open
     unpublished = bot.format_notification(_project("x", "App"), proposal, None)
@@ -659,8 +707,33 @@ def test_format_notification_shows_price_deadline_and_link() -> None:
     assert "github.com" not in unpublished
 
 
+def test_format_notification_flags_unpriced_proposal() -> None:
+    proposal = bot.Proposal(
+        folder="2026-10-07-10-00-workana-app", price="a definir", deadline="a definir", priced=False
+    )
+
+    text = bot.format_notification(_project("x", "App"), proposal, None, published=True)
+
+    assert text == (
+        "🆕 <b>App</b>\nhttps://www.workana.com/job/x\n\n"
+        "💰 <b>Sem preço:</b> vaga aberta demais. A proposta pede detalhes antes do valor.\n"
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app">Proposta e análise</a>'
+    )
+    # Not on GitHub yet: the push warning still follows the unpriced line
+    unpublished = bot.format_notification(_project("x", "App"), proposal, None)
+    assert unpublished.endswith(
+        "antes do valor.\n⚠️ Proposta gravada, mas não subiu para o GitHub."
+    )
+    assert "github.com" not in unpublished
+
+
 def _fake_claude(
-    monkeypatch, returncode: int = 0, output: dict | None = None, outputs: list[dict] | None = None
+    monkeypatch,
+    returncode: int = 0,
+    output: dict | None = None,
+    outputs: list[dict] | None = None,
+    stderr: str = "",
 ) -> list[dict]:
     """Fakes the CLI; `outputs` answers call by call, repeating the last one."""
     calls: list[dict] = []
@@ -669,7 +742,7 @@ def _fake_claude(
     def fake_run(cmd, **kwargs):
         calls.append({"cmd": cmd, **kwargs})
         answer = answers[min(len(calls), len(answers)) - 1]
-        return SimpleNamespace(returncode=returncode, stdout=json.dumps(answer))
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(answer), stderr=stderr)
 
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
     return calls
@@ -691,7 +764,7 @@ def test_call_claude_runs_print_mode_without_api_key(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
     calls = _fake_claude(monkeypatch, output={"structured_output": {"is_match": True}})
 
-    assert _call_claude() == {"is_match": True}
+    assert _call_claude()["structured_output"] == {"is_match": True}
     cmd = calls[0]["cmd"]
     assert cmd[:2] == ["claude", "-p"]
     assert cmd[cmd.index("--model") + 1] == bot.FIT_MODEL
@@ -712,20 +785,34 @@ def test_call_claude_runs_print_mode_without_api_key(monkeypatch) -> None:
 
 def test_call_claude_raises_on_cli_failure(monkeypatch) -> None:
     _fake_claude(
-        monkeypatch, returncode=1, output={"is_error": True, "api_error_status": 401}
+        monkeypatch,
+        returncode=1,
+        output={"is_error": True, "api_error_status": 401},
+        stderr="erro sigiloso",
     )
 
-    with pytest.raises(bot.ProposalError, match="código 1.*api_error_status=401"):
+    with pytest.raises(bot.ProposalError, match="código 1.*api_error_status=401") as exc_info:
         _call_claude()
+
+    assert exc_info.value.details == {
+        "returncode": 1,
+        "output": {"is_error": True, "api_error_status": 401},
+        "stderr": "erro sigiloso",
+    }
+    assert "erro sigiloso" not in str(exc_info.value)
 
 
 def test_call_claude_raises_on_non_json_output(monkeypatch) -> None:
     monkeypatch.setattr(
-        bot.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="boom")
+        bot.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="boom", stderr=""),
     )
 
-    with pytest.raises(bot.ProposalError, match="código 1"):
+    with pytest.raises(bot.ProposalError, match="código 1") as exc_info:
         _call_claude()
+
+    assert exc_info.value.details["output"] == {}
 
 
 def test_call_claude_raises_without_structured_output(monkeypatch) -> None:
@@ -737,7 +824,7 @@ def test_call_claude_raises_without_structured_output(monkeypatch) -> None:
 
 SKILL_TEXT = "# proposta-freela de teste\nSiga os Passos 1 a 5."
 AGENT_FILES = {bot.PROPOSAL_FILE: "Proposta.", bot.ANALYSIS_FILE: "Análise."}
-AGENT_SUMMARY = {"price": "R$ 6 000", "deadline": "1 dia + 3 semanas"}
+AGENT_SUMMARY = {"priced": True, "price": "R$ 6 000", "deadline": "1 dia + 3 semanas"}
 
 
 @pytest.fixture
@@ -759,9 +846,12 @@ def _fake_agent(
     files: dict[str, str] | None = None,
     returncode: int = 0,
     error: Exception | None = None,
+    summary: dict | None = None,
+    cli_fields: dict | None = None,
 ) -> list[dict]:
     """Fakes the agent: writes `files` (AGENT_FILES by default) in its cwd, then answers
-    AGENT_SUMMARY or raises `error`."""
+    `summary` (AGENT_SUMMARY by default) or raises `error`. `cli_fields` are extra
+    fields of the CLI's JSON output."""
     written = AGENT_FILES if files is None else files
     calls: list[dict] = []
 
@@ -772,7 +862,11 @@ def _fake_agent(
         if error is not None:
             raise error
         return SimpleNamespace(
-            returncode=returncode, stdout=json.dumps({"structured_output": AGENT_SUMMARY})
+            returncode=returncode,
+            stdout=json.dumps(
+                {"structured_output": summary or AGENT_SUMMARY, **(cli_fields or {})}
+            ),
+            stderr="",
         )
 
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
@@ -849,8 +943,9 @@ def test_generate_proposal_runs_agent_with_restricted_tools(skill, monkeypatch) 
     # The skill as it is, as the system prompt; the bot's rules only say how it runs
     assert _flag(cmd, "--system-prompt") == SKILL_TEXT
     instructions = _flag(cmd, "--append-system-prompt")
-    assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder)
+    assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder, unpriced=bot.UNPRICED)
     assert str(folder) in instructions and "Pule o Passo 5" in instructions
+    assert f"`priced` false e `{bot.UNPRICED}` nos dois" in instructions
     assert _flag(cmd, "--tools") == "Read,Write,Edit,Bash"
     home_skill = bot.SKILL_DIR.as_posix().lstrip("/")
     real_skill = skill.resolve().as_posix().lstrip("/")
@@ -910,6 +1005,16 @@ def test_agent_runs_with_minimal_env(skill, monkeypatch) -> None:
     assert "ANTHROPIC_API_KEY" not in env and "GITHUB_TOKEN" not in env
 
 
+def test_generate_proposal_keeps_unpriced_flag(skill, monkeypatch) -> None:
+    unpriced = {"priced": False, "price": bot.UNPRICED, "deadline": bot.UNPRICED}
+    _fake_agent(monkeypatch, summary=unpriced)
+
+    proposal = bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    # Proposal.priced defaults to True: only passing the agent's answer on gets False here
+    assert proposal.priced is False
+
+
 @pytest.mark.parametrize(
     ("files", "returncode", "error", "match"),
     [
@@ -930,9 +1035,156 @@ def test_generate_proposal_cleans_folder_on_failure(
     with pytest.raises(expected, match=match):
         bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
 
-    # The run's folder is gone, with whatever the agent left in it
+    # The half-written folder moved to LOGS_DIR with the reason for the failure
     assert bot.GENERATED_DIR.is_dir()
     assert list(bot.GENERATED_DIR.iterdir()) == []
+    [log] = list(bot.LOGS_DIR.iterdir())
+    assert log.name.endswith("-workana-app-novo")
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    if files and set(files) == {bot.PROPOSAL_FILE}:
+        assert (log / bot.PROPOSAL_FILE).read_text() == "Proposta."
+    if error is not None:
+        assert failure["error"] == "TimeoutExpired"
+    if returncode == 1:
+        assert failure["returncode"] == 1
+
+
+def test_generate_proposal_logs_missing_files(skill, monkeypatch, capsys) -> None:
+    _fake_agent(
+        monkeypatch,
+        files={},
+        cli_fields={
+            "num_turns": 7,
+            "permission_denials": [{"tool_name": "Write"}],
+            "result": "Resumo sem arquivos",
+        },
+    )
+
+    with pytest.raises(bot.ProposalError, match="não gravou"):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    assert list(bot.GENERATED_DIR.iterdir()) == []
+    [log] = list(bot.LOGS_DIR.iterdir())
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    assert "não gravou" in failure["error"]
+    assert failure["num_turns"] == 7
+    assert failure["permission_denials"] == [{"tool_name": "Write"}]
+    assert failure["result"] == "Resumo sem arquivos"
+    assert failure["returncode"] is None
+    captured = capsys.readouterr()
+    assert "Resumo sem arquivos" not in captured.out
+    assert "Resumo sem arquivos" not in captured.err
+
+
+def test_generate_proposal_removes_folder_when_log_fails(skill, monkeypatch, capsys) -> None:
+    _fake_agent(monkeypatch, files={})
+
+    def broken_log(*args, **kwargs):
+        raise OSError("disco sigiloso")
+
+    monkeypatch.setattr(bot, "write_failure_log", broken_log)
+
+    with pytest.raises(bot.ProposalError, match="não gravou"):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    assert list(bot.GENERATED_DIR.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "Falha ao gravar o log da proposta: OSError" in err
+    assert "disco sigiloso" not in err
+
+
+def test_generate_proposal_logs_invalid_output_by_class_name(skill, monkeypatch) -> None:
+    _fake_agent(monkeypatch, summary={"price": "R$ 1"})
+
+    with pytest.raises(ValidationError):
+        bot.generate_proposal("oauth-tok", SKILL_TEXT, _project("x", "App novo"), "descrição")
+
+    [log] = list(bot.LOGS_DIR.iterdir())
+    failure = json.loads((log / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["error"] == "ValidationError"
+    assert failure["result"] is None
+
+
+def _failed_folder(name: str = "2026-10-15-10-00-workana-x") -> Path:
+    folder = bot.GENERATED_DIR / name
+    folder.mkdir(parents=True)
+    return folder
+
+
+def test_write_failure_log_moves_folder_and_redacts_token(workdir) -> None:
+    folder = _failed_folder()
+    (folder / bot.PROPOSAL_FILE).write_text("Proposta.")
+    project = {"id": "x", **_queued("x", "App novo", bot.JobStatus.PROPOSAL, attempts=1)}
+    error = bot.ProposalError(
+        "claude saiu com código 1",
+        details={
+            "returncode": 1,
+            "stderr": "falhou com oauth-tok",
+            "output": {
+                "subtype": "error_max_turns",
+                "num_turns": 12,
+                "duration_ms": 50_000,
+                "total_cost_usd": 0.4,
+                "permission_denials": [{"tool_input": {"command": "echo oauth-tok"}}],
+                "result": "oauth-tok " + "x" * bot.LOG_FIELD_MAX_CHARS,
+            },
+        },
+    )
+
+    target = bot.write_failure_log(folder, project, error, "oauth-tok")
+
+    assert target == bot.LOGS_DIR / folder.name
+    assert not folder.exists()
+    assert (target / bot.PROPOSAL_FILE).read_text() == "Proposta."
+    raw = (target / bot.FAILURE_LOG_FILE).read_text()
+    failure = json.loads(raw)
+    assert failure["status"] == "proposal"
+    assert failure["attempts"] == 2
+    assert failure["retries"] == 0
+    assert failure["error"] == "claude saiu com código 1"
+    assert failure["returncode"] == 1
+    assert len(failure["result"]) == bot.LOG_FIELD_MAX_CHARS
+    assert failure["result"].startswith("*** ")
+    assert "oauth-tok" not in raw
+    assert "***" in failure["stderr"]
+    assert "***" in json.dumps(failure["permission_denials"])
+
+    bare = bot.write_failure_log(
+        _failed_folder("2026-10-15-10-01-workana-y"), _project("y", "Sem status"), error, "oauth-tok"
+    )
+    failure = json.loads((bare / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["status"] is None
+    assert failure["attempts"] == 1
+    assert failure["retries"] == 0
+
+
+def test_write_failure_log_creates_missing_folder_and_avoids_collision(workdir) -> None:
+    folder = bot.GENERATED_DIR / "2026-10-15-10-00-workana-x"
+    error = bot.ProposalError("falhou")
+
+    first = bot.write_failure_log(folder, _project("x", "App"), error, "")
+    second = bot.write_failure_log(folder, _project("x", "App"), error, "")
+
+    assert [p.name for p in first.iterdir()] == [bot.FAILURE_LOG_FILE]
+    assert second == bot.LOGS_DIR / f"{folder.name}-2"
+    assert [p.name for p in first.iterdir()] == [bot.FAILURE_LOG_FILE]
+    assert json.loads((second / bot.FAILURE_LOG_FILE).read_text())["error"] == "falhou"
+
+
+def test_write_failure_log_keeps_timeout_partial_output(workdir) -> None:
+    error = subprocess.TimeoutExpired("claude", 1200, output=b"parcial \xff", stderr=b"oauth-tok erro")
+    target = bot.write_failure_log(_failed_folder(), _project("x", "App"), error, "oauth-tok")
+    failure = json.loads((target / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["stdout"] == "parcial \ufffd"
+    assert failure["stderr"] == "*** erro"
+    assert failure["error"] == "TimeoutExpired"
+    assert failure["returncode"] is None
+
+    empty = subprocess.TimeoutExpired("claude", 1200, output=None, stderr=None)
+    target = bot.write_failure_log(_failed_folder("outra"), _project("x", "App"), empty, "oauth-tok")
+    failure = json.loads((target / bot.FAILURE_LOG_FILE).read_text())
+    assert failure["stdout"] is None
+    assert failure["stderr"] is None
 
 
 AGENT_PROPOSAL = bot.Proposal(
@@ -942,13 +1194,10 @@ AGENT_PROPOSAL = bot.Proposal(
 
 def _alert_tail(proposal: bot.Proposal) -> str:
     """The alert's lines after the job link, for a proposal that reached GitHub."""
-    link = (
-        "https://github.com/leandrorochaadm/proposta/blob/main/generated/"
-        f"{proposal.folder}/proposta.md"
-    )
+    folder = f"https://github.com/leandrorochaadm/proposta/tree/main/generated/{proposal.folder}"
     return (
         f"\n\n💰 <b>Preço:</b> {proposal.price}\n⏱ <b>Prazo:</b> {proposal.deadline}"
-        f'\n📄 <a href="{link}">Proposta</a>'
+        f'\n📁 <a href="{folder}">Proposta e análise</a>'
     )
 
 
@@ -1027,6 +1276,7 @@ def test_pending_roundtrip_keeps_status_description_and_proposal(workdir) -> Non
         "folder": "2026-10-07-10-00-workana-app-a",
         "price": "R$ 6 000",
         "deadline": "1 dia + 3 semanas",
+        "priced": True,
     }
     assert stored["b"] == {
         "title": "App b",
@@ -1042,9 +1292,29 @@ def test_pending_roundtrip_keeps_status_description_and_proposal(workdir) -> Non
     assert loaded["a"]["proposal"] == AGENT_PROPOSAL
 
 
+def test_pending_proposal_without_priced_loads_as_priced(workdir) -> None:
+    # Written before the field existed: those alerts always showed a price
+    bot.PENDING_FILE.write_text(
+        json.dumps(
+            {
+                "a": {
+                    "title": "App a",
+                    "url": "u",
+                    "status": "alert",
+                    "attempts": 0,
+                    "proposal": {"folder": "f", "price": "R$ 1 000", "deadline": "1 dia"},
+                }
+            }
+        )
+    )
+
+    assert bot.load_pending()["a"]["proposal"].priced is True
+
+
 def test_job_status_from_api_falls_back_to_triage(workdir, capsys) -> None:
     for status in bot.JobStatus:
         assert bot.JobStatus.from_api(status.value, "job-1") is status
+    assert bot.JobStatus.FAILED.value == "failed"
     assert capsys.readouterr().err == ""
     bot.PENDING_FILE.write_text(
         json.dumps(
@@ -1172,6 +1442,7 @@ def test_alert_has_proposal_link(with_agent, published, sent) -> None:
                         "folder": "2026-10-07-10-00-workana-app-a",
                         "price": "R$ 6 000",
                         "deadline": "1 dia + 3 semanas",
+                        "priced": True,
                     },
                 }
             },
@@ -1181,8 +1452,8 @@ def test_alert_has_proposal_link(with_agent, published, sent) -> None:
     assert sent == [
         "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
         "💰 <b>Preço:</b> R$ 6 000\n⏱ <b>Prazo:</b> 1 dia + 3 semanas\n"
-        '📄 <a href="https://github.com/leandrorochaadm/proposta/blob/main/generated/'
-        '2026-10-07-10-00-workana-app-a/proposta.md">Proposta</a>'
+        '📁 <a href="https://github.com/leandrorochaadm/proposta/tree/main/generated/'
+        '2026-10-07-10-00-workana-app-a">Proposta e análise</a>'
     ]
     assert bot.load_seen() == {"a"}
     assert bot.load_pending() == {}
@@ -1235,6 +1506,29 @@ def test_alert_status_with_missing_folder_regenerates(with_agent, published, sen
     assert bot.load_pending() == {}
 
 
+FAILED_ALERT_TEXT = "⚠️ Proposta não gerada: ficou na fila e o bot tenta de novo em 6 h."
+
+
+def _due_failed(pid: str, title: str, retries: int = 0, **extra) -> dict:
+    """A FAILED job whose retry is due."""
+    return _queued(
+        pid,
+        title,
+        bot.JobStatus.FAILED,
+        description=f"descrição {pid}",
+        failed_at=datetime.now(UTC) - timedelta(hours=bot.FAILED_RETRY_HOURS + 1),
+        retries=retries,
+        **extra,
+    )
+
+
+def _assert_parked(job: dict, retries: int, since: datetime) -> None:
+    assert job["status"] is bot.JobStatus.FAILED
+    assert job["attempts"] == 0
+    assert job["retries"] == retries
+    assert since <= job["failed_at"] <= datetime.now(UTC)
+
+
 def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, capsys) -> None:
     bot.save_pending(
         {"a": _queued("a", "App com erro", bot.JobStatus.PROPOSAL, description="descrição a")}
@@ -1249,16 +1543,21 @@ def test_propose_alerts_without_proposal_after_max_attempts(with_agent, sent, ca
         )
     }
 
+    before = datetime.now(UTC)
     for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
         bot.main(PROPOSE_ARGV)
 
     assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
-    assert sent == [
-        "🆕 <b>App com erro</b>\nhttps://www.workana.com/job/a\n\n"
-        "⚠️ Proposta não gerada: erro ao gerar a proposta"
-    ]
-    assert bot.load_seen() == {"a"}
-    assert bot.load_pending() == {}
+    assert sent == [f"🆕 <b>App com erro</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"]
+    assert bot.load_seen() == set()
+    pending = bot.load_pending()
+    _assert_parked(pending["a"], retries=0, since=before)
+    assert pending["a"]["description"] == "descrição a"
+    assert bot.has_queue(pending) is False
+    # Parked: the next run neither calls the agent nor alerts again
+    bot.main(PROPOSE_ARGV)
+    assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
+    assert len(sent) == 1
     err = capsys.readouterr().err
     assert "ValueError" in err
     assert "sigiloso" not in err
@@ -1293,18 +1592,16 @@ def test_propose_without_skill_counts_attempt(
     pending = bot.load_pending()
     assert (pending["a"]["attempts"], pending["b"]["attempts"]) == (1, 0)
 
+    before = datetime.now(UTC)
     for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
         bot.main(PROPOSE_ARGV)
 
     assert with_agent == []
-    assert sent == [
-        "🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n"
-        "⚠️ Proposta não gerada: erro ao gerar a proposta"
-    ]
-    assert bot.load_seen() == {"a"}
-    assert bot.load_pending() == {
-        "b": _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
-    }
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"]
+    assert bot.load_seen() == set()
+    pending = bot.load_pending()
+    _assert_parked(pending["a"], retries=0, since=before)
+    assert pending["b"] == _queued("b", "App b", bot.JobStatus.PROPOSAL, description="descrição b")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1595,3 +1892,291 @@ def test_open_browser_routes_through_browser_proxy(monkeypatch, proxy, expected)
         pass
 
     assert launches == [{"headless": True, "proxy": expected}]
+
+
+def _failed(**kw) -> dict:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    return _queued(
+        "f",
+        "App",
+        bot.JobStatus.FAILED,
+        **{"failed_at": now - timedelta(hours=7), "retries": 0, **kw},
+    )
+
+
+def test_retry_due() -> None:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    cooldown = timedelta(hours=bot.FAILED_RETRY_HOURS)
+
+    assert bot.retry_due(_failed(), now)
+    assert bot.retry_due(_failed(failed_at=now - cooldown), now)
+    assert not bot.retry_due(_failed(failed_at=now - cooldown + timedelta(seconds=1)), now)
+    assert bot.retry_due(_failed(retries=bot.MAX_FAILED_RETRIES - 1), now)
+    assert not bot.retry_due(_failed(retries=bot.MAX_FAILED_RETRIES), now)
+    assert bot.retry_due(_failed(failed_at=datetime.min.replace(tzinfo=UTC)), now)
+    # Entries of other statuses carry neither field
+    assert not bot.retry_due(_queued("p", "App", bot.JobStatus.PROPOSAL), now)
+    assert not bot.retry_due(_queued("a", "App", bot.JobStatus.ALERT), now)
+
+
+def test_has_queue_counts_due_failed_job() -> None:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    recent = _failed(failed_at=now - timedelta(hours=1))
+    triage = _queued("t", "App", bot.JobStatus.TRIAGE)
+
+    assert bot.has_queue({"f": _failed()}, now)
+    assert not bot.has_queue({"f": recent}, now)
+    assert not bot.has_queue({}, now)
+    assert not bot.has_queue({"t": triage, "f": recent}, now)
+    assert bot.has_queue({"t": triage, "f": _failed()}, now)
+    # Without now it reads the clock
+    assert bot.has_queue({"f": _failed(failed_at=datetime.now(UTC) - timedelta(hours=7))})
+
+
+def _write_raw_pending(entries: dict) -> None:
+    bot.PENDING_FILE.write_text(json.dumps(entries))
+
+
+def _raw_failed(**extra) -> dict:
+    return {"title": "App", "url": "u", "status": "failed", "attempts": 0, **extra}
+
+
+@pytest.mark.parametrize(
+    "raw_failed_at",
+    [{}, {"failed_at": "ontem-secreto"}, {"failed_at": "0001-01-01T00:00:00+05:00"}],
+    ids=["missing", "invalid", "out-of-range"],
+)
+def test_pending_failed_without_failed_at_is_due(workdir, capsys, raw_failed_at) -> None:
+    _write_raw_pending({"job-7": _raw_failed(**raw_failed_at)})
+
+    pending = bot.load_pending()
+
+    job = pending["job-7"]
+    assert job["failed_at"] == datetime.min.replace(tzinfo=UTC)
+    assert job["retries"] == 0
+    assert bot.retry_due(job, datetime.now(UTC))
+    assert bot.has_queue(pending)
+    err = capsys.readouterr().err
+    assert "job-7" in err
+    assert "ontem-secreto" not in err
+
+    bot.save_pending(pending)
+    capsys.readouterr()
+    assert bot.load_pending()["job-7"]["failed_at"] == datetime.min.replace(tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["2026-10-15T09:30:00", "2026-10-15T06:30:00-03:00"],
+    ids=["naive", "offset"],
+)
+def test_pending_failed_at_loads_as_utc(workdir, raw) -> None:
+    _write_raw_pending({"job-9": _raw_failed(failed_at=raw, retries=1)})
+
+    pending = bot.load_pending()
+
+    failed_at = pending["job-9"]["failed_at"]
+    assert failed_at == datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+    assert failed_at.utcoffset() == timedelta(0)
+    bot.retry_due(pending["job-9"], datetime.now(UTC))
+    bot.save_pending(pending)
+    stored = json.loads(bot.PENDING_FILE.read_text())
+    assert stored["job-9"]["failed_at"] == "2026-10-15T09:30:00+00:00"
+
+
+def test_pending_failed_with_invalid_retries_resets_to_zero(workdir, capsys) -> None:
+    _write_raw_pending(
+        {"job-8": _raw_failed(failed_at="2026-10-15T09:30:00+00:00", retries="segredo-8")}
+    )
+
+    pending = bot.load_pending()
+
+    assert pending["job-8"]["retries"] == 0
+    assert bot.has_queue(pending)
+    err = capsys.readouterr().err
+    assert "job-8" in err
+    assert "segredo-8" not in err
+
+    # A missing counter is the intermediate version: zero, no line
+    _write_raw_pending({"job-7": _raw_failed(failed_at="2026-10-15T09:30:00+00:00")})
+    assert bot.load_pending()["job-7"]["retries"] == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_pending_roundtrip_keeps_failed_at_and_retries(workdir) -> None:
+    failed_at = datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+    pending = {
+        "f": _queued("f", "App f", bot.JobStatus.FAILED, failed_at=failed_at, retries=2),
+        "a": _queued("a", "App a", bot.JobStatus.ALERT, failed_at=failed_at, retries=3),
+    }
+
+    bot.save_pending(pending)
+
+    stored = json.loads(bot.PENDING_FILE.read_text())
+    assert stored["f"]["status"] == "failed"
+    assert stored["f"]["failed_at"] == "2026-10-15T09:30:00+00:00"
+    assert stored["f"]["retries"] == 2
+    loaded = bot.load_pending()
+    assert loaded == pending
+    assert isinstance(loaded["f"]["failed_at"], datetime)
+    assert isinstance(loaded["a"]["failed_at"], datetime)
+    assert bot._pending_entry({"id": "f", **pending["f"]}) == pending["f"]
+    assert pending["f"]["failed_at"] is failed_at
+
+
+def test_propose_parks_failed_only_after_alert_is_sent(with_agent, sent, monkeypatch) -> None:
+    bot.save_pending(
+        {"a": _queued("a", "App com erro FALHA", bot.JobStatus.PROPOSAL, description="descrição a")}
+    )
+    for _ in range(bot.MAX_JOB_ATTEMPTS - 1):
+        bot.main(PROPOSE_ARGV)
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(PROPOSE_ARGV)
+
+    assert exc.value.code == 1
+    assert sent == []
+    job = bot.load_pending()["a"]
+    assert job["status"] is bot.JobStatus.ALERT
+    assert job["attempts"] == bot.MAX_JOB_ATTEMPTS
+    assert "proposal" not in job and "failed_at" not in job
+    assert bot.load_seen() == set()
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, text: sent.append(text))
+    before = datetime.now(UTC)
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == [
+        f"🆕 <b>App com erro FALHA</b>\nhttps://www.workana.com/job/a\n\n{FAILED_ALERT_TEXT}"
+    ]
+    assert len(with_agent) == bot.MAX_JOB_ATTEMPTS
+    _assert_parked(bot.load_pending()["a"], retries=0, since=before)
+    assert bot.load_seen() == set()
+
+
+def test_propose_retries_failed_job_after_cooldown(with_agent, sent, capsys) -> None:
+    bot.save_pending({"a": _due_failed("a", "App a", retries=2)})
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == [("oauth-test", SKILL_TEXT, "a", "descrição a")]
+    assert sent == [f"🆕 <b>App a</b>\nhttps://www.workana.com/job/a{AGENT_ALERT_TAIL}"]
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+    bot.save_pending({"e": _due_failed("e", "App com erro", retries=2)})
+    sent.clear()
+    before = datetime.now(UTC)
+    bot.main(PROPOSE_ARGV)
+
+    assert sent == []
+    _assert_parked(bot.load_pending()["e"], retries=3, since=before)
+    err = capsys.readouterr().err
+    assert "ValueError" in err
+    assert "sigiloso" not in err
+    calls = len(with_agent)
+    bot.main(PROPOSE_ARGV)
+    assert len(with_agent) == calls
+
+
+def test_propose_failed_retry_keeps_alert_when_telegram_fails(
+    with_agent, published, sent, monkeypatch
+) -> None:
+    bot.save_pending({"a": _due_failed("a", "App FALHA", retries=1)})
+
+    with pytest.raises(SystemExit) as exc:
+        bot.main(PROPOSE_ARGV)
+
+    assert exc.value.code == 1
+    job = bot.load_pending()["a"]
+    assert job["status"] is bot.JobStatus.ALERT
+    assert job["proposal"] == AGENT_PROPOSAL
+    assert job["retries"] == 1
+    assert bot.load_seen() == set()
+
+    monkeypatch.setattr(bot, "send_telegram", lambda _t, _c, text: sent.append(text))
+    bot.main(PROPOSE_ARGV)
+
+    assert len(with_agent) == 1
+    assert len(published.calls) == 1
+    assert len(sent) == 1
+    assert bot.load_seen() == {"a"}
+    assert bot.load_pending() == {}
+
+
+@pytest.mark.parametrize(
+    ("failed_at_hours", "retries"),
+    [(1, 0), (bot.FAILED_RETRY_HOURS + 1, bot.MAX_FAILED_RETRIES)],
+    ids=["cooling", "exhausted"],
+)
+def test_propose_skips_failed_job_not_due(with_agent, sent, failed_at_hours, retries) -> None:
+    job = _due_failed("a", "App a", retries=retries)
+    job["failed_at"] = datetime.now(UTC) - timedelta(hours=failed_at_hours)
+    bot.save_pending({"a": job})
+    saved = bot.load_pending()
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == []
+    assert bot.load_pending() == saved
+
+
+@pytest.mark.parametrize(
+    ("retries", "last"),
+    [(bot.MAX_FAILED_RETRIES - 2, False), (bot.MAX_FAILED_RETRIES - 1, True)],
+    ids=["before-last", "last"],
+)
+def test_propose_stops_retrying_after_max_failed_retries(
+    with_agent, sent, capsys, retries, last
+) -> None:
+    bot.save_pending({"a": _due_failed("a", "App com erro", retries=retries)})
+
+    bot.main(PROPOSE_ARGV)
+
+    job = bot.load_pending()["a"]
+    assert job["retries"] == retries + 1
+    assert job["status"] is bot.JobStatus.FAILED
+    message = "Vaga https://www.workana.com/job/a sem novas tentativas automáticas"
+    assert (message in capsys.readouterr().err) is last
+    if last:
+        later = datetime.now(UTC) + timedelta(hours=bot.FAILED_RETRY_HOURS + 1)
+        assert bot.retry_due(job, later) is False
+    assert sent == []
+
+
+def test_propose_without_skill_counts_failed_retry(
+    with_agent, sent, monkeypatch, capsys
+) -> None:
+    _drop_skill(monkeypatch)
+    bot.save_pending({"a": _due_failed("a", "App a")})
+    before = datetime.now(UTC)
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == []
+    assert sent == []
+    _assert_parked(bot.load_pending()["a"], retries=1, since=before)
+    assert "Skill proposta-freela não encontrada" in capsys.readouterr().err
+
+
+def test_propose_prefers_new_job_over_failed_retry(with_agent, sent) -> None:
+    failed = _due_failed("f", "App f", retries=1)
+    bot.save_pending(
+        {
+            "f": failed,
+            "p": _queued("p", "App p", bot.JobStatus.PROPOSAL, description="descrição p"),
+        }
+    )
+    saved = bot.load_pending()["f"]
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent == [("oauth-test", SKILL_TEXT, "p", "descrição p")]
+    assert bot.load_pending() == {"f": saved}
+
+    bot.main(PROPOSE_ARGV)
+
+    assert with_agent[-1][2] == "f"
+    assert bot.load_seen() == {"p", "f"}
+    assert bot.load_pending() == {}

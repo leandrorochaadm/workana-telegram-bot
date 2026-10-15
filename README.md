@@ -17,14 +17,15 @@ O bot roda em dois workflows do GitHub Actions:
 
 | Workflow | Disparo | Limite | O que faz |
 |----------|---------|--------|-----------|
-| `monitor.yml` | Cloudflare Worker a cada 15 min (e cron reserva de hora em hora) | 14 min | Lê a Workana, filtra pelas palavras-chave, lê a descrição, faz a triagem e põe a vaga aprovada na fila. Se houver fila, dispara o `proposal.yml` |
+| `monitor.yml` | Cloudflare Worker a cada 15 min (e cron reserva de hora em hora) | 14 min | Lê a Workana, filtra pelas palavras-chave, lê a descrição, faz a triagem e põe a vaga aprovada na fila. Se houver vaga pronta na fila, dispara o `proposal.yml` |
 | `proposal.yml` | O `monitor.yml` (ou à mão) | 30 min | Gera **uma** proposta da fila, publica no `proposta` e manda o aviso no Telegram |
 
 1. O `monitor.yml` acha uma vaga nova cujo título casa com `KEYWORDS` e a põe na fila
    (`proposta/data/pending.json`).
 2. Ele abre a página da vaga, lê a descrição e faz a [triagem](#triagem). Aprovada, a vaga
    espera o `proposal.yml`; recusada, não chega no Telegram.
-3. O `proposal.yml` pega a vaga mais antiga da fila, gera a proposta com a skill e grava uma
+3. O `proposal.yml` pega a vaga mais antiga da fila (uma vaga nova sempre passa na frente de uma
+   que já falhou), gera a proposta com a skill e grava uma
    pasta em `proposta/generated/`.
 4. O bot faz commit e push dessa pasta no `proposta` e só então manda o aviso no Telegram, com o
    link do `proposta.md`.
@@ -32,7 +33,7 @@ O bot roda em dois workflows do GitHub Actions:
 Os dois workflows nunca rodam ao mesmo tempo (grupo de `concurrency` `proposta-repo`), porque
 os dois gravam o `proposta/data/pending.json`. Enquanto uma proposta é gerada, o monitor espera.
 Por isso o aviso chega alguns minutos depois de a vaga aparecer na Workana, e sai uma vaga por
-execução do `proposal.yml`: o monitor dispara o `proposal.yml` de novo enquanto houver fila.
+execução do `proposal.yml`: o monitor dispara o `proposal.yml` de novo enquanto houver vaga pronta na fila (a `failed` só conta quando chega a hora da nova tentativa).
 
 ## Execução no GitHub Actions
 
@@ -98,14 +99,17 @@ O token expira (no máximo em 1 ano). Ao renovar, rode `npx wrangler secret put 
 
 O `proposta` guarda:
 - `data/seen.json`: vagas já processadas, para não avisar duas vezes.
-- `data/pending.json`: a fila, com a etapa de cada vaga (`triage`, `proposal` ou `alert`).
+- `data/pending.json`: a fila, com a etapa de cada vaga (`triage`, `proposal`, `alert` ou `failed`).
 - `data/rejected.json`: vagas recusadas na triagem (título, link e data), para ajustar o critério.
 - `prompts/fit_prompt.md`: o critério da triagem.
 - `generated/`: uma pasta por proposta, `AAAA-MM-DD-hh-mm-workana-<título>` (horário de
   Brasília), com `proposta.md` e `analise.md`, ao lado das propostas feitas à mão.
+- `logs/`: uma pasta por falha do agente, com o mesmo nome da pasta da proposta (sufixo `-2`,
+  `-3` se repetir), com o que o agente chegou a gravar e um `failure.json` com o motivo (ver
+  [Quando a proposta falha](#quando-a-proposta-falha)).
 
 Os workflows fazem commit no `proposta` a cada execução: `chore: update seen projects` (monitor),
-`chore: update proposal queue` (proposta) e um `chore: add workana proposal <pasta>` por
+`chore: update proposal queue and logs` (proposta) e um `chore: add workana proposal <pasta>` por
 proposta. Rode `git pull` no seu clone do `proposta` antes de editar qualquer arquivo dele.
 
 Sem o `proposta`, o bot não roda: ele para com `Pasta proposta/data não encontrada` em vez de
@@ -176,8 +180,9 @@ repositório não guarda nenhuma regra de proposta nem de preço: mudou a skill 
   recebe os tokens do Telegram. O texto da vaga é tratado como dado, nunca como instrução. Quem
   faz o commit é o bot.
 - Uma proposta por execução, com até 20 min para o agente (`PROPOSAL_TIMEOUT_SECONDS`). Se ele
-  falhar ou passar do tempo, a pasta é apagada e a vaga continua na fila. Depois de
-  `MAX_JOB_ATTEMPTS` (3) falhas, o aviso sai sem proposta, com `⚠️ Proposta não gerada`.
+  falhar ou passar do tempo, a pasta vai para `proposta/logs/` e a vaga continua na fila. Depois
+  de `MAX_JOB_ATTEMPTS` (3) falhas, o aviso sai sem proposta e a vaga fica para nova tentativa
+  (ver [Quando a proposta falha](#quando-a-proposta-falha)).
 - Se o checkout da skill falhar, o `proposal.yml` conta uma falha na vaga e termina vermelho
   (o GitHub manda e-mail).
 
@@ -189,15 +194,75 @@ https://www.workana.com/job/...
 
 💰 Preço: R$ 6 000
 ⏱ Prazo: 1 dia + 3 semanas
-📄 Proposta   (link para generated/<pasta>/proposta.md no GitHub)
+📁 Proposta e análise   (link para a pasta generated/<pasta>/ no GitHub, com proposta.md e analise.md)
 ```
 
+- Vaga aberta demais para orçar vem com `💰 Sem preço: vaga aberta demais. A proposta pede
+  detalhes antes do valor.` no lugar de Preço e Prazo; o motivo está no `analise.md`.
 - O link só abre com login na conta dona do `proposta` (repositório privado), também no celular.
 - Se o push da proposta falhar, no lugar do link vem `⚠️ Proposta gravada, mas não subiu para o
   GitHub.`. O fim do workflow tenta o push de novo.
 - Cada envio ao Telegram é tentado até `TELEGRAM_SEND_ATTEMPTS` (3) vezes. Se o aviso não sair,
   a vaga fica na fila com a proposta pronta, e o próximo `proposal.yml` manda só o aviso, sem
-  gerar outra.
+  gerar outra. Sem proposta, a vaga só passa a `failed` depois que o aviso sai.
+
+### Quando a proposta falha
+
+- Cada falha do agente (não gravou os arquivos, saiu com erro, devolveu resposta inválida ou
+  passou de 20 min) move a pasta pela metade de `generated/` para `logs/<pasta>/`, com um
+  `failure.json`. Em `generated/` só fica proposta completa.
+- Depois de 3 falhas, o Telegram recebe o aviso da vaga com
+  `⚠️ Proposta não gerada: ficou na fila e o bot tenta de novo em 6 h.` e a vaga fica em
+  `pending.json` com status `failed`, `failed_at` (data da falha, em UTC) e `retries` (novas
+  tentativas já feitas).
+- A cada 6 h (`FAILED_RETRY_HOURS`), o `proposal.yml` tenta de novo, uma vez, só quando não há
+  vaga nova na fila. Até 8 vezes (`MAX_FAILED_RETRIES`, cerca de 2 dias).
+- Deu certo: sai o aviso normal, com preço e link, e a vaga sai da fila. Falhou: nenhum aviso
+  novo; `retries` em `pending.json` sobe 1 e sai um `failure.json` novo (o `retries` dele conta
+  as novas tentativas feitas antes desta: 0 na 1ª).
+- Quando a 8ª nova tentativa falha (11 falhas ao todo, contando as 3 primeiras), o log do
+  `proposal.yml` mostra `Vaga <link> sem novas tentativas automáticas` e a vaga fica parada
+  como `failed`.
+- Sem a skill, sem o token ou sem o `claude`, a nova tentativa também conta, mas não gera
+  `failure.json` (o agente nem roda): o motivo está no log do `Run bot`.
+- Uma palavra de `EXCLUDE_KEYWORDS` no título tira a vaga `failed` da fila, como qualquer outra.
+
+#### Liberar uma vaga parada
+
+1. No seu clone do `proposta`, rode `git pull`.
+2. Em `data/pending.json`, na vaga, troque `retries` por `0`. O status continua `failed`.
+3. Se a última falha foi há menos de 6 h e você quer tentar já, apague também a linha
+   `failed_at`: a vaga fica pronta na hora (o log mostra `Vaga <id> com falha sem data válida,
+   tentando de novo`, e é esperado).
+4. Faça commit e push (ex.: `chore: retry failed proposal`). O próximo `monitor.yml` dispara o
+   `proposal.yml`; para não esperar, `gh workflow run proposal.yml`.
+
+Se falhar de novo, não sai outro aviso no Telegram (o primeiro já saiu).
+
+#### O que tem no `failure.json`
+
+- `url` e `title`: a vaga.
+- `status`: etapa da vaga na fila (`proposal` ou `failed`).
+- `attempts`: tentativa de 1 a 3 numa `proposal`; vale sempre 1 numa `failed`.
+- `retries`: novas tentativas feitas antes desta.
+- `error`: o motivo curto da falha.
+- `returncode`: código de saída do `claude`.
+- `subtype`: tipo de término informado pelo `claude`.
+- `num_turns`: quantos passos o agente deu. Olhe aqui primeiro.
+- `duration_ms` e `total_cost_usd`: tempo e custo da execução.
+- `permission_denials`: o que o agente tentou fazer e foi barrado. Olhe aqui primeiro.
+- `result`: o resumo que o agente devolveu. Olhe aqui primeiro.
+- `stderr`: a saída de erro do `claude`.
+- `stdout`: só no timeout, o que o `claude` escreveu antes de ser cortado.
+
+Chave sem valor aparece como `null`. Textos longos são cortados em 20 000 caracteres e o token
+aparece como `***`.
+
+- Por que não vai para o log do Actions: este repositório é público, e `result`, `stderr` e os
+  arquivos pela metade podem trazer texto da vaga, da proposta ou da skill. O log do Actions
+  mostra só a frase curta `Falha na proposta de …`.
+- As pastas de `logs/` não são apagadas sozinhas: apague as antigas à mão no seu clone do
+  `proposta`.
 
 ### Revise antes de colar na Workana
 
@@ -286,7 +351,8 @@ gh run list --workflow proposal.yml --limit 5
 gh run watch                      # acompanha um run em andamento
 ```
 
-Sem vaga na fila, o `proposal.yml` termina sem gerar nada.
+Sem vaga pronta na fila, o `proposal.yml` termina sem gerar nada: uma vaga `failed` só roda
+quando chega a hora da nova tentativa.
 
 Para pausar o bot, desligue os dois workflows; para voltar, troque `disable` por `enable`:
 
@@ -312,4 +378,4 @@ Com o `monitor.yml` desligado, os disparos do Worker recebem erro: é esperado.
   vezes), a fila e as vagas que a triagem recusou.
 - O `monitor.yml` roda a cada 15 minutos, disparado pelo Cloudflare Worker.
 - Os logs do Actions são públicos: o bot nunca imprime o texto da proposta, e um erro do `git`
-  aparece só com o código de saída.
+  aparece só com o código de saída. O motivo de uma falha do agente vai só para `proposta/logs/`.
