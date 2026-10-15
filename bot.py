@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
@@ -268,8 +268,20 @@ def save_seen(seen: set[str]) -> None:
     SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
 
 
+def _load_failed_at(raw: object, job_id: str) -> datetime:
+    """failed_at as a UTC datetime; an unusable value means "due now", so a hand edit never blocks the retry."""
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw)
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        except (ValueError, OverflowError):
+            pass
+    print(f"Vaga {job_id} com falha sem data válida, tentando de novo", file=sys.stderr)
+    return datetime.min.replace(tzinfo=UTC)
+
+
 def load_pending() -> dict[str, dict]:
-    """The queue, typed: status as JobStatus, proposal as Proposal."""
+    """The queue, typed: status as JobStatus, proposal as Proposal, failed_at as a UTC datetime."""
     if not PENDING_FILE.exists():
         return {}
     pending = json.loads(PENDING_FILE.read_text())
@@ -277,6 +289,14 @@ def load_pending() -> dict[str, dict]:
         job["status"] = JobStatus.from_api(job.get("status"), pid)
         if "proposal" in job:
             job["proposal"] = Proposal.model_validate(job["proposal"])
+        if job["status"] is JobStatus.FAILED or "failed_at" in job:
+            job["failed_at"] = _load_failed_at(job.get("failed_at"), pid)
+        if job["status"] is JobStatus.FAILED:
+            retries = job.get("retries", 0)
+            if isinstance(retries, bool) or not isinstance(retries, int):
+                print(f"Vaga {pid} com contador de tentativas inválido, zerando", file=sys.stderr)
+                retries = 0
+            job["retries"] = retries
     return pending
 
 
@@ -286,6 +306,8 @@ def save_pending(pending: dict[str, dict]) -> None:
         entry = {**job, "status": job["status"].value}
         if "proposal" in job:
             entry["proposal"] = job["proposal"].model_dump()
+        if "failed_at" in job:
+            entry["failed_at"] = job["failed_at"].isoformat()
         stored[pid] = entry
     PENDING_FILE.write_text(json.dumps(stored, ensure_ascii=False, indent=2))
 
@@ -308,9 +330,21 @@ def load_fit_prompt() -> str | None:
     return FIT_PROMPT_FILE.read_text().strip() or None
 
 
-def has_queue(pending: dict[str, dict]) -> bool:
-    """Whether proposal.yml has work: a proposal to write or an alert to send."""
-    return any(job["status"] in PROPOSAL_RUN_STATUSES for job in pending.values())
+def retry_due(job: dict, now: datetime) -> bool:
+    """Whether a FAILED job is due for one more automatic try."""
+    if job["status"] is not JobStatus.FAILED:
+        return False
+    if job["retries"] >= MAX_FAILED_RETRIES:
+        return False
+    return now - job["failed_at"] >= timedelta(hours=FAILED_RETRY_HOURS)
+
+
+def has_queue(pending: dict[str, dict], now: datetime | None = None) -> bool:
+    """Whether proposal.yml has work: a proposal to write, an alert to send or a failed job due for a retry."""
+    now = now or datetime.now(UTC)
+    return any(
+        job["status"] in PROPOSAL_RUN_STATUSES or retry_due(job, now) for job in pending.values()
+    )
 
 
 def write_output(name: str, value: str) -> None:
@@ -944,14 +978,15 @@ def run_monitor(
             else:
                 seen.add(project["id"])
         # Also drops jobs queued before a word was excluded, unless their proposal is
-        # already written and only the alert is missing
+        # already written and only the alert is missing. FAILED jobs are dropped too, on
+        # purpose: the excluded word says the job no longer matters, so no more retries.
         for pid, job in list(pending.items()):
             if job["status"] is not JobStatus.ALERT and matches_keywords(job["title"], excluded):
                 pending.pop(pid)
                 seen.add(pid)
         save_state()
-        # dicts keep insertion order, so this is oldest first; PROPOSAL and ALERT jobs
-        # belong to proposal.yml
+        # dicts keep insertion order, so this is oldest first; PROPOSAL, ALERT and
+        # FAILED jobs belong to proposal.yml
         candidates = [
             {"id": pid, **job}
             for pid, job in pending.items()
@@ -1146,15 +1181,15 @@ def triage(
 
 
 def _pending_entry(project: dict) -> dict:
-    """What pending.json keeps of a job; status and proposal stay typed until save_pending."""
+    """What pending.json keeps of a job; status, proposal and failed_at stay typed until save_pending."""
     entry = {
         "title": project["title"],
         "url": project["url"],
         "status": project["status"],
         "attempts": project["attempts"],
     }
-    # Set by the triage and by the agent, in that order
-    for key in ("description", "proposal"):
+    # Set by the triage, by the agent and by a given-up proposal, in that order
+    for key in ("description", "proposal", "failed_at", "retries"):
         if key in project:
             entry[key] = project[key]
     return entry

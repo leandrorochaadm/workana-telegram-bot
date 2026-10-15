@@ -3,7 +3,7 @@ import os
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -225,28 +225,74 @@ def test_main_skips_excluded_jobs_including_queued_ones(workdir, sent, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "extra", "expected"),
     [
-        (None, "false"),
+        (None, {}, "false"),
         # Without the triage the monitor alerts it at once: nothing left for proposal.yml
-        (bot.JobStatus.TRIAGE, "false"),
-        (bot.JobStatus.PROPOSAL, "true"),
-        (bot.JobStatus.ALERT, "true"),
+        (bot.JobStatus.TRIAGE, {}, "false"),
+        (bot.JobStatus.PROPOSAL, {}, "true"),
+        (bot.JobStatus.ALERT, {}, "true"),
+        (
+            bot.JobStatus.FAILED,
+            {"failed_at": datetime.now(UTC) - timedelta(hours=7), "retries": 0},
+            "true",
+        ),
+        (
+            bot.JobStatus.FAILED,
+            {"failed_at": datetime.now(UTC) - timedelta(hours=1), "retries": 0},
+            "false",
+        ),
+        (
+            bot.JobStatus.FAILED,
+            {
+                "failed_at": datetime.now(UTC) - timedelta(hours=7),
+                "retries": bot.MAX_FAILED_RETRIES,
+            },
+            "false",
+        ),
     ],
-    ids=["empty", "triage", "proposal", "alert"],
+    ids=["empty", "triage", "proposal", "alert", "failed-due", "failed-cooling", "failed-exhausted"],
 )
-def test_monitor_writes_has_queue_output(workdir, sent, monkeypatch, status, expected) -> None:
+def test_monitor_writes_has_queue_output(
+    workdir, sent, monkeypatch, status, extra, expected
+) -> None:
     output = workdir / "github_output"
     output.write_text("earlier=1\n")
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     if status is not None:
-        bot.save_pending({"x": _queued("x", "App novo", status)})
+        bot.save_pending({"x": _queued("x", "App novo", status, **extra)})
     monkeypatch.setattr(bot, "fetch_projects", lambda: [])
 
     bot.main(MONITOR_ARGV)
 
     # Appended: the file holds the other steps' outputs too
     assert output.read_text() == f"earlier=1\nhas_queue={expected}\n"
+
+
+def test_monitor_drops_failed_job_with_excluded_keyword(workdir, sent, monkeypatch) -> None:
+    with bot.ENV_FILE.open("a") as f:
+        f.write("EXCLUDE_KEYWORDS=jogo\n")
+    output = workdir / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    bot.save_pending(
+        {
+            "f": _queued(
+                "f",
+                "App de jogo",
+                bot.JobStatus.FAILED,
+                failed_at=datetime.now(UTC) - timedelta(hours=7),
+                retries=1,
+            )
+        }
+    )
+    monkeypatch.setattr(bot, "fetch_projects", lambda: [])
+
+    bot.main(MONITOR_ARGV)
+
+    assert bot.load_pending() == {}
+    assert bot.load_seen() == {"f"}
+    assert sent == []
+    assert output.read_text() == "has_queue=false\n"
 
 
 def test_monitor_writes_has_queue_when_listing_fails(workdir, monkeypatch) -> None:
@@ -1820,3 +1866,133 @@ def test_open_browser_routes_through_browser_proxy(monkeypatch, proxy, expected)
         pass
 
     assert launches == [{"headless": True, "proxy": expected}]
+
+
+def _failed(**kw) -> dict:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    return _queued(
+        "f",
+        "App",
+        bot.JobStatus.FAILED,
+        **{"failed_at": now - timedelta(hours=7), "retries": 0, **kw},
+    )
+
+
+def test_retry_due() -> None:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    cooldown = timedelta(hours=bot.FAILED_RETRY_HOURS)
+
+    assert bot.retry_due(_failed(), now)
+    assert bot.retry_due(_failed(failed_at=now - cooldown), now)
+    assert not bot.retry_due(_failed(failed_at=now - cooldown + timedelta(seconds=1)), now)
+    assert bot.retry_due(_failed(retries=bot.MAX_FAILED_RETRIES - 1), now)
+    assert not bot.retry_due(_failed(retries=bot.MAX_FAILED_RETRIES), now)
+    assert bot.retry_due(_failed(failed_at=datetime.min.replace(tzinfo=UTC)), now)
+    # Entries of other statuses carry neither field
+    assert not bot.retry_due(_queued("p", "App", bot.JobStatus.PROPOSAL), now)
+    assert not bot.retry_due(_queued("a", "App", bot.JobStatus.ALERT), now)
+
+
+def test_has_queue_counts_due_failed_job() -> None:
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    recent = _failed(failed_at=now - timedelta(hours=1))
+    triage = _queued("t", "App", bot.JobStatus.TRIAGE)
+
+    assert bot.has_queue({"f": _failed()}, now)
+    assert not bot.has_queue({"f": recent}, now)
+    assert not bot.has_queue({}, now)
+    assert not bot.has_queue({"t": triage, "f": recent}, now)
+    assert bot.has_queue({"t": triage, "f": _failed()}, now)
+    # Without now it reads the clock
+    assert bot.has_queue({"f": _failed(failed_at=datetime.now(UTC) - timedelta(hours=7))})
+
+
+def _write_raw_pending(entries: dict) -> None:
+    bot.PENDING_FILE.write_text(json.dumps(entries))
+
+
+def _raw_failed(**extra) -> dict:
+    return {"title": "App", "url": "u", "status": "failed", "attempts": 0, **extra}
+
+
+@pytest.mark.parametrize(
+    "raw_failed_at",
+    [{}, {"failed_at": "ontem-secreto"}, {"failed_at": "0001-01-01T00:00:00+05:00"}],
+    ids=["missing", "invalid", "out-of-range"],
+)
+def test_pending_failed_without_failed_at_is_due(workdir, capsys, raw_failed_at) -> None:
+    _write_raw_pending({"job-7": _raw_failed(**raw_failed_at)})
+
+    pending = bot.load_pending()
+
+    job = pending["job-7"]
+    assert job["failed_at"] == datetime.min.replace(tzinfo=UTC)
+    assert job["retries"] == 0
+    assert bot.retry_due(job, datetime.now(UTC))
+    assert bot.has_queue(pending)
+    err = capsys.readouterr().err
+    assert "job-7" in err
+    assert "ontem-secreto" not in err
+
+    bot.save_pending(pending)
+    capsys.readouterr()
+    assert bot.load_pending()["job-7"]["failed_at"] == datetime.min.replace(tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["2026-10-15T09:30:00", "2026-10-15T06:30:00-03:00"],
+    ids=["naive", "offset"],
+)
+def test_pending_failed_at_loads_as_utc(workdir, raw) -> None:
+    _write_raw_pending({"job-9": _raw_failed(failed_at=raw, retries=1)})
+
+    pending = bot.load_pending()
+
+    failed_at = pending["job-9"]["failed_at"]
+    assert failed_at == datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+    assert failed_at.utcoffset() == timedelta(0)
+    bot.retry_due(pending["job-9"], datetime.now(UTC))
+    bot.save_pending(pending)
+    stored = json.loads(bot.PENDING_FILE.read_text())
+    assert stored["job-9"]["failed_at"] == "2026-10-15T09:30:00+00:00"
+
+
+def test_pending_failed_with_invalid_retries_resets_to_zero(workdir, capsys) -> None:
+    _write_raw_pending(
+        {"job-8": _raw_failed(failed_at="2026-10-15T09:30:00+00:00", retries="segredo-8")}
+    )
+
+    pending = bot.load_pending()
+
+    assert pending["job-8"]["retries"] == 0
+    assert bot.has_queue(pending)
+    err = capsys.readouterr().err
+    assert "job-8" in err
+    assert "segredo-8" not in err
+
+    # A missing counter is the intermediate version: zero, no line
+    _write_raw_pending({"job-7": _raw_failed(failed_at="2026-10-15T09:30:00+00:00")})
+    assert bot.load_pending()["job-7"]["retries"] == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_pending_roundtrip_keeps_failed_at_and_retries(workdir) -> None:
+    failed_at = datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+    pending = {
+        "f": _queued("f", "App f", bot.JobStatus.FAILED, failed_at=failed_at, retries=2),
+        "a": _queued("a", "App a", bot.JobStatus.ALERT, failed_at=failed_at, retries=3),
+    }
+
+    bot.save_pending(pending)
+
+    stored = json.loads(bot.PENDING_FILE.read_text())
+    assert stored["f"]["status"] == "failed"
+    assert stored["f"]["failed_at"] == "2026-10-15T09:30:00+00:00"
+    assert stored["f"]["retries"] == 2
+    loaded = bot.load_pending()
+    assert loaded == pending
+    assert isinstance(loaded["f"]["failed_at"], datetime)
+    assert isinstance(loaded["a"]["failed_at"], datetime)
+    assert bot._pending_entry({"id": "f", **pending["f"]}) == pending["f"]
+    assert pending["f"]["failed_at"] is failed_at
