@@ -168,8 +168,10 @@ próximo `monitor.yml` já usa.
 
 A proposta é escrita por um agente do Claude Code (`claude-sonnet-5-5`, esforço médio) que
 segue a skill `proposta-freela`, a mesma usada à mão, lida do `dotfiles` como está. Este
-repositório não guarda nenhuma regra de proposta nem de preço: mudou a skill e deu push no
-`dotfiles`, o próximo `proposal.yml` já usa (ver [Editar a skill](#editar-a-skill)).
+repositório não guarda regra de proposta nem de preço: mudou a skill e deu push no
+`dotfiles`, o próximo `proposal.yml` já usa (ver [Editar a skill](#editar-a-skill)). A única
+exceção é o valor mínimo de projeto da skill, que o bot manda ignorar: nenhuma vaga deixa de
+ter proposta por valor baixo.
 
 - O `proposal.yml` baixa só a pasta da skill do `dotfiles` e cria o link
   `~/.claude/skills/proposta-freela`, porque a skill roda os scripts dela por esse caminho.

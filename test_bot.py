@@ -946,6 +946,7 @@ def test_generate_proposal_runs_agent_with_restricted_tools(skill, monkeypatch) 
     assert instructions == bot.BOT_INSTRUCTIONS.format(folder=folder, unpriced=bot.UNPRICED)
     assert str(folder) in instructions and "Pule o Passo 5" in instructions
     assert f"`priced` false e `{bot.UNPRICED}` nos dois" in instructions
+    assert "Ignore o valor mínimo de projeto da skill" in instructions
     assert _flag(cmd, "--tools") == "Read,Write,Edit,Bash"
     home_skill = bot.SKILL_DIR.as_posix().lstrip("/")
     real_skill = skill.resolve().as_posix().lstrip("/")
